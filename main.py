@@ -841,14 +841,14 @@ async def cmd_start(ev):
                        "/vonyat — проверка: пинг и жив ли юзербот")
 
 
-@bot.on(events.NewMessage(pattern=r"^/(notify|dont-notify|dont_notify)(@\w+)?(\s|$)"))
+@bot.on(events.NewMessage(pattern=r"^/(notify|dontnotify|dont-notify|dont_notify)(@\w+)?(\s|$)"))
 async def cmd_ctrl_notify(ev):
     """Уведомления о событиях: /dont-notify выключить в чате, /notify включить."""
     if not ev.is_private and not await _admin_only(ev):
         await ev.reply("Команда только для админов.")
         return
     body = (ev.raw_text or "").split()[0].split("@")[0].lower()
-    if body in ("/dont-notify", "/dont_notify"):
+    if body in ("/dont-notify", "/dont_notify", "/dontnotify"):
         STATE["muted"].add(ev.chat_id)
         save_muted()
         log.info("уведомления выключены в %s", ev.chat_id)
