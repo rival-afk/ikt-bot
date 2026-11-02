@@ -278,7 +278,7 @@ def route(text):
 
 
 async def send_pair(text):
-    """Напоминания/уведомления о событиях: чат с /тихо не получает их."""
+    """Напоминания/уведомления о событиях: чат с /dont-notify не получает их."""
     if DRY:
         log.info("[DRY] %s", text.replace("\n", " / ")[:160])
         return
@@ -394,11 +394,12 @@ async def sir_round():
         log.info("[DRY] СИР: %s", text.replace("\n", " / ")[:160])
     else:
         await bot.send_message(GROUP, text, parse_mode="html",
-                               buttons=[[Button.url("Перейти к боту", BOT_LINK)]])
+                               buttons=[[Button.url("Пройти сир и мэс",
+                                                    BOT_LINK + "?start=sir")]])
         for u in missed:
             try:
                 await bot.send_message(u["id"],
-                                       "Не забудь заполнить сир и мэс. Заполнить: /сир")
+                                       "Не забудь заполнить сир и мэс. Заполнить: /sir")
             except Exception:
                 pass
 
@@ -470,13 +471,14 @@ async def sir_launch(uid, send):
     await send("Выбери свою деятельность:", buttons=act_keyboard())
 
 
-@bot.on(events.NewMessage(pattern=r"^/сир(@\w+)?(\s|$)"))
+@bot.on(events.NewMessage(pattern=r"^/sir(@\w+)?(\s|$)"))
 async def cmd_sir(ev):
     """Заполнение СИР и МЭС — только в ЛС."""
     if not ev.is_private:
         try:
-            await ev.reply("Заполнение СИР и МЭС — только в ЛС с ботом.",
-                           buttons=[[Button.url("Перейти к боту", BOT_LINK)]])
+            await ev.reply("Заполнение сир и мэс — только в ЛС с ботом.",
+                           buttons=[[Button.url("Пройти сир и мэс",
+                                                BOT_LINK + "?start=sir")]])
         except Exception:
             pass
         return
@@ -825,37 +827,37 @@ async def poll_channel():
 @bot.on(events.NewMessage(pattern=r"^/start(@\w+)?(\s|$)"))
 async def cmd_start(ev):
     if ev.is_private:
+        # deep-link кнопки «Пройти сир и мэс»: /start sir — сразу к заполнению
+        payload = (ev.raw_text or "").strip().split()
+        if len(payload) > 1 and payload[1].lower() == "sir":
+            await sir_launch(ev.sender_id, ev.reply)
+            return
         await ev.reply("Привет! Я слежу за Ноябриками и ПЛАНЧИКом.\n"
                        "Пересылаю важное в ЛС и в ИиКТ, напоминаю о событиях.\n\n"
                        "/plan — план на день\n/next — ближайшее напоминание\n"
-                       "/тихо — выключить напоминания (в этом чате)\n"
-                       "/громко — включить напоминания обратно\n"
-                       "/сир — заполнить сир и мэс\n"
+                       "/dont-notify — выключить напоминания (в этом чате)\n"
+                       "/notify — включить напоминания обратно\n"
+                       "/sir — заполнить сир и мэс\n"
                        "/vonyat — проверка: пинг и жив ли юзербот")
 
 
-@bot.on(events.NewMessage(pattern=r"^/тихо(@\w+)?(\s|$)"))
-async def cmd_mute(ev):
-    """Выключить напоминания о событиях в этом чате (в группах — только админы)."""
+@bot.on(events.NewMessage(pattern=r"^/(notify|dont-notify|dont_notify)(@\w+)?(\s|$)"))
+async def cmd_ctrl_notify(ev):
+    """Уведомления о событиях: /dont-notify выключить в чате, /notify включить."""
     if not ev.is_private and not await _admin_only(ev):
         await ev.reply("Команда только для админов.")
         return
-    STATE["muted"].add(ev.chat_id)
-    save_muted()
-    log.info("уведомления выключены в %s", ev.chat_id)
-    await ev.reply("Напоминания о событиях выключены в этом чате. Вернуть: /громко.")
-
-
-@bot.on(events.NewMessage(pattern=r"^/громко(@\w+)?(\s|$)"))
-async def cmd_unmute(ev):
-    """Включить напоминания о событиях в этом чате обратно."""
-    if not ev.is_private and not await _admin_only(ev):
-        await ev.reply("Команда только для админов.")
-        return
-    STATE["muted"].discard(ev.chat_id)
-    save_muted()
-    log.info("уведомления включены в %s", ev.chat_id)
-    await ev.reply("Напоминания о событиях включены обратно.")
+    body = (ev.raw_text or "").split()[0].split("@")[0].lower()
+    if body in ("/dont-notify", "/dont_notify"):
+        STATE["muted"].add(ev.chat_id)
+        save_muted()
+        log.info("уведомления выключены в %s", ev.chat_id)
+        await ev.reply("Напоминания о событиях выключены в этом чате. Вернуть: /notify")
+    else:
+        STATE["muted"].discard(ev.chat_id)
+        save_muted()
+        log.info("уведомления включены в %s", ev.chat_id)
+        await ev.reply("Напоминания о событиях включены обратно.")
 
 
 @bot.on(events.NewMessage(pattern=r"^/(vonyat|вонять)(@\w+)?(\s|$)"))
