@@ -9,7 +9,7 @@ import sys
 import time
 from pathlib import Path
 
-from telethon import TelegramClient, events
+from telethon import Button, TelegramClient, events
 from telethon.tl import functions, types
 import plan as planmod
 
@@ -355,8 +355,10 @@ async def sir_people():
             if getattr(u, "bot", False) or getattr(u, "deleted", False):
                 continue
             part = getattr(p, "participant", None)
+            skip = isinstance(part, (types.ChannelParticipantAdmin,
+                                     types.ChannelParticipantCreator))
             rank = getattr(part, "rank", None) or ""
-            skip = bool(getattr(part, "admin_rights", None)) or "тимлид" in rank.lower()
+            skip = skip or "тимлид" in rank.lower()
             if skip:
                 continue
             people[u.id] = {"username": getattr(u, "username", None),
@@ -435,6 +437,92 @@ async def sir_launch(uid, send):
         return
     STATE["sir_session"].pop(uid, None)
     await send("Выбери свою деятельность:", buttons=act_keyboard())
+
+
+@bot.on(events.NewMessage(pattern=r"^/сир(@\w+)?(\s|$)"))
+async def cmd_sir(ev):
+    """Заполнение СИР и МЭС — только в ЛС."""
+    if not ev.is_private:
+        try:
+            await ev.reply("Заполнение СИР и МЭС — только в ЛС с ботом.",
+                           buttons=[[Button.url("Перейти к боту", BOT_LINK)]])
+        except Exception:
+            pass
+        return
+    await sir_launch(ev.sender_id, ev.reply)
+
+
+@bot.on(events.NewMessage)
+async def sir_pm(ev):
+    """ЛС: машина состояний СИР/МЭС (имя, эмодзи, кнопки). Слэш-команды не трогаем."""
+    if not ev.is_private:
+        return
+    text = (ev.raw_text or "").strip()
+    if text.startswith("/"):
+        return
+    session = (STATE.get("sir_session") or {}).get(ev.sender_id)
+
+    if session and session["stage"] == "fio":
+        words = text.split()
+        ok = len(words) == 2 and all(FIO_RE.match(w) for w in words)
+        if not ok:
+            await ev.reply("Нужно ровно два слова и только русские буквы. Ещё раз:")
+            return
+        STATE["users"].setdefault(str(ev.sender_id), {})["name"] = " ".join(
+            w.capitalize() for w in words)
+        save_users()
+        session["stage"] = "emoji"
+        await ev.reply("Записал: %s.\nТеперь отправь эмодзи, которым тебя удобно "
+                       "упоминать в чатах." % STATE["users"][str(ev.sender_id)]["name"])
+        return
+
+    if session and session["stage"] == "emoji":
+        if not text or len(text) > 8 or re.search(r"[A-Za-z0-9А-ЯЁа-яё]", text):
+            await ev.reply("Это не похоже на эмодзи. Отправь один эмодзи:")
+            return
+        STATE["users"].setdefault(str(ev.sender_id), {})["emoji"] = text
+        save_users()
+        await ev.reply("Принято.")
+        await sir_launch(ev.sender_id, ev.reply)
+        return
+
+    # без сессии: любое сообщение в ЛС с незаполненным СИР/МЭС — приглашение заполнить
+    filled = STATE.get("sir", {}).get("filled", {})
+    if str(ev.sender_id) not in filled and ev.sender_id in (await sir_people()):
+        STATE["sir_session"].pop(ev.sender_id, None)
+        await sir_launch(ev.sender_id, ev.reply)
+
+
+@bot.on(events.CallbackQuery(data=re.compile(rb"sir(act|mood):(.+)")))
+async def sir_callback(ev):
+    """Кнопки деятельность/настроение."""
+    uid = ev.sender_id
+    prof = STATE["users"].get(str(uid)) or {}
+    # без регистрации (имя+эмодзи) кнопки не активны
+    if not (prof.get("name") and prof.get("emoji")):
+        await ev.answer("Сначала регистрация: введи фамилию и имя.", alert=True)
+        await ev.edit("Фамилия и имя через пробел (например: Иванов Иван).")
+        STATE["sir_session"] = STATE.get("sir_session") or {}
+        STATE["sir_session"][uid] = {"stage": "fio"}
+        return
+    kind, _, payload = ev.data.decode().partition(":")
+    STATE["sir_session"] = STATE.get("sir_session") or {}
+    session = STATE["sir_session"].setdefault(uid, {})
+    if kind == "siract":
+        session["act"] = payload
+        await ev.edit("Твоя деятельность: %s.\nТеперь выбери настроение:" % payload,
+                      buttons=mood_keyboard())
+        return
+    act = session.get("act")
+    if not act:
+        await ev.edit("Сначала выбери деятельность:", buttons=act_keyboard())
+        return
+    mood = payload.replace("|", " ")
+    STATE["sir"]["filled"][str(uid)] = {"act": act, "mood": mood}
+    save_sir()
+    STATE["sir_session"].pop(uid, None)
+    await ev.edit("Записал: деятельность — %s, настроение — %s." % (act, mood),
+                  buttons=None)
 
 
 
@@ -711,6 +799,7 @@ async def cmd_start(ev):
                        "/plan — план на день\n/next — ближайшее напоминание\n"
                        "/тихо — выключить напоминания (в этом чате)\n"
                        "/громко — включить напоминания обратно\n"
+                       "/сир — заполнить сир и мэс\n"
                        "/vonyat — проверка: пинг и жив ли юзербот")
 
 
@@ -914,36 +1003,44 @@ async def cmd_all(ev):
     if not (ev.is_group or ev.is_channel):
         await ev.reply("Эта команда работает в группе.")
         return
+    items, seen = [], set()
     try:
-        users = []
-        async for u in ub.iter_participants(ev.chat_id):
+        async for p in ub.iter_participants(ev.chat_id):
+            u = p.user
             if getattr(u, "bot", False) or getattr(u, "deleted", False):
                 continue
-            if getattr(u, "username", None):
-                users.append("@" + u.username)
+            prof = STATE["users"].get(str(u.id))
+            if prof and prof.get("emoji"):          # зарегистрированный — эмодзи-юз
+                mention = sir_mention(u.id, getattr(u, "username", None),
+                                      getattr(u, "first_name", ""))
+            elif getattr(u, "username", None):
+                mention = "@" + u.username
+            else:
+                continue                             # без юза и без регистрации не упомянуть
+            if u.id in seen:
+                continue
+            seen.add(u.id)
+            items.append(mention)
     except Exception as e:
         await ev.reply("Не могу получить участников: %s" % type(e).__name__)
         return
 
-    seen, uniq = set(), []
-    for u in users:
-        if u.lower() not in seen:
-            seen.add(u.lower())
-            uniq.append(u)
-    if not uniq:
+    if not items:
         await ev.reply("В чате нет участников с юзернеймами.")
         return
 
-    chunks, cur = [], ""
-    for u in uniq:
-        if len(cur) + len(u) + 1 > 3500:
+    chunks, cur, curlen = [], [], 0
+    for it in items:
+        if curlen + len(it) + 1 > 3500:
             chunks.append(cur)
-            cur = ""
-        cur += ("\n" if cur else "") + u
-    chunks.append(cur)
+            cur, curlen = [], 0
+        cur.append(it)
+        curlen += len(it) + 1
+    if cur:
+        chunks.append(cur)
 
     for c in chunks:
-        await ev.reply(c)
+        await ev.reply("\n".join(c), parse_mode="html")
 
 
 @bot.on(events.NewMessage(pattern=r"^/next(@\w+)?(\s|$)"))
@@ -980,6 +1077,8 @@ async def _run():
     load_sent()
     load_seen()
     load_muted()
+    load_users()
+    load_sir()
 
     await bot.start(bot_token=ENV["BOT_TOKEN"])
     await ub.connect()
@@ -1003,6 +1102,7 @@ async def _run():
     log.info("работаю: канал=%s, группа=%s, владелец=%s", CHANNEL, GROUP, OWNER)
     asyncio.create_task(scheduler())
     asyncio.create_task(poll_channel())
+    asyncio.create_task(sir_loop())
     await asyncio.gather(bot.run_until_disconnected(), ub.run_until_disconnected())
 
 
