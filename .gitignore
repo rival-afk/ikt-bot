@@ -1,0 +1,10 @@
+# секреты — никогда не коммитить
+.env
+
+# телеграм-сессии и состояние бота
+sessions/
+.run/
+__pycache__/
+bot.log
+*.session
+*.session-journal

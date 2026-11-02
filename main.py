@@ -1,0 +1,1013 @@
+"""Ноябрики → ЛС + ИиКТ: пересылка важного и напоминания по ПЛАНЧИКу."""
+import asyncio
+import datetime as dt
+import json
+import logging
+import re
+import os
+import sys
+import time
+from pathlib import Path
+
+from telethon import TelegramClient, events
+from telethon.tl import functions, types
+import plan as planmod
+
+ROOT = Path(__file__).resolve().parent
+log = logging.getLogger("ikt")
+
+
+def load_env():
+    env = {}
+    p = ROOT / ".env"
+    if p.exists():
+        for line in p.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            env[k.strip()] = v.strip().strip('"').strip("'")
+    return env
+
+
+ENV = load_env()
+CFG = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
+
+API_ID = int(ENV["API_ID"])
+API_HASH = ENV["API_HASH"]
+OWNER = int(CFG.get("owner_id") or ENV.get("OWNER_ID") or 0)
+CHANNEL = int(CFG["channel_id"])
+GROUP = int(CFG["group_id"])
+EXTRA_GROUPS = [int(x) for x in CFG.get("extra_groups", [])]
+GROUPS = [GROUP] + EXTRA_GROUPS
+TARGETS = [OWNER] + GROUPS
+
+bot = TelegramClient(str(ROOT / "sessions" / "bot"), API_ID, API_HASH)
+ub = TelegramClient(str(ROOT / "sessions" / "ikt-bot"), API_ID, API_HASH,
+                    device_model="ikt-bot", system_version="Termux", app_version="1.0")
+
+STATE = {
+    "plan": None,          # {"date": date, "events": [...]}
+    "seen": set(),         # id сообщений Ноябриков
+    "sent": set(),         # ключи отправленных напоминаний
+}
+SENT_FILE = ROOT / "sessions" / ".sent.json"
+SEEN_FILE = ROOT / "sessions" / ".seen.json"
+RECENT_FILE = ROOT / "sessions" / ".recent.json"
+MUTED_FILE = ROOT / "sessions" / ".muted.json"
+LOCK_FILE = ROOT / ".run" / "bot.lock"
+
+
+def acquire_lock():
+    """Защита от второго инстанса (иначе бот отвечает на всё дважды)."""
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if LOCK_FILE.exists():
+        try:
+            pid = int(LOCK_FILE.read_text().strip())
+            os.kill(pid, 0)
+            log.error("бот уже запущен (pid %s) — второй инстанс не стартую", pid)
+            return False
+        except (ValueError, ProcessLookupError, TypeError):
+            pass
+    LOCK_FILE.write_text(str(os.getpid()))
+    return True
+
+
+def release_lock():
+    try:
+        if LOCK_FILE.exists() and LOCK_FILE.read_text().strip() == str(os.getpid()):
+            LOCK_FILE.unlink()
+    except Exception:
+        pass
+DRY = "--test" in sys.argv
+
+
+def save_sent():
+    try:
+        SENT_FILE.write_text(json.dumps(sorted(STATE["sent"]), ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def load_sent():
+    try:
+        STATE["sent"] = set(json.loads(SENT_FILE.read_text(encoding="utf-8")))
+    except Exception:
+        STATE["sent"] = set()
+
+
+def save_muted():
+    try:
+        MUTED_FILE.write_text(json.dumps(sorted(STATE["muted"])), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def load_muted():
+    try:
+        STATE["muted"] = set(int(x) for x in json.loads(MUTED_FILE.read_text(encoding="utf-8")))
+    except Exception:
+        STATE["muted"] = set()
+
+
+def save_seen():
+    try:
+        keep = sorted(STATE["seen"])[-2000:]
+        SEEN_FILE.write_text(json.dumps(keep), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def load_seen():
+    try:
+        STATE["seen"] = set(json.loads(SEEN_FILE.read_text(encoding="utf-8")))
+    except Exception:
+        STATE["seen"] = set()
+    try:
+        STATE["recent"] = json.loads(RECENT_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        STATE["recent"] = {}
+
+
+def save_recent():
+    try:
+        RECENT_FILE.write_text(json.dumps(STATE["recent"], ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def is_duplicate(caption):
+    """True, если такой же пост уже отправляли за последние 30 минут."""
+    now = time.time()
+    recent = STATE.setdefault("recent", {})
+    for k in [k for k, t in recent.items() if now - t > 1800]:
+        del recent[k]
+    if caption in recent:
+        return True
+    recent[caption] = now
+    if len(recent) > 500:
+        for k in sorted(recent, key=lambda k: recent[k])[:250]:
+            del recent[k]
+    save_recent()
+    return False
+
+
+def is_important(text):
+    low = (text or "").lower()
+    for p in CFG["transfer_exclude"]:
+        if p in low:
+            return False
+    return any(p in low for p in CFG["transfer_include"])
+
+
+MEAL_WORDS = ("завтрак", "обед", "ужин")
+
+
+async def adjust_meal_reminder(text):
+    """Пост Ноябриков про еду: «зовем на ужин»/«накрыт» — еда сейчас,
+    напоминание по плану отменяем; явное время в посте — сдвигаем."""
+    low = (text or "").lower()
+    meal = next((w for w in MEAL_WORDS if w in low), None)
+    if not meal:
+        return
+    p = STATE["plan"]
+    if not p:
+        return
+    now = dt.datetime.now()
+
+    def is_match(e):
+        lab = e["label"].lower()
+        # новый шаблон планчика: еда называется «нутрений/обеденный/вечерний ням-ням»
+        names = {"завтрак": ("завтрак", "ням-ням"),
+                 "обед": ("обед", "ням-ням"),
+                 "ужин": ("ужин", "ням-ням")}.get(meal, (meal,))
+        if not any(n in lab for n in names):
+            return False
+        if meal == "ужин" and ("2-й" in lab or "второй" in lab) and "2-й" not in low:
+            return False
+        return True
+
+    cands = [e for e in p["events"] if e["kind"] == "five" and is_match(e)
+             and e["when"].date() == now.date()]
+    if not cands:
+        return
+    e = min(cands, key=lambda x: abs((x["when"] - now).total_seconds()))
+
+    tm = planmod.extract_time(text)
+    if tm:
+        new_when = dt.datetime.combine(e["when"].date(), dt.time(*tm))
+        if new_when > now and abs((new_when - e["when"]).total_seconds()) > 120:
+            log.info("еда по посту сдвинута: %s -> %s", e["when"], new_when)
+            e["when"] = new_when
+            return
+
+    if e["when"] > now:
+        k5 = "%s|%s|5" % (e["when"].isoformat(), e["label"])
+        kstart = "%s|%s|start" % (e["when"].isoformat(), e["label"])
+        if k5 in STATE["sent"] or kstart in STATE["sent"]:
+            return   # напоминание уже ушло/отменено — второй раз не пишем
+        # отменяем все будущие напоминания этого события (5 мин, 30 мин, старт)
+        for o in (5, 30):
+            STATE["sent"].add("%s|%s|%d" % (e["when"].isoformat(), e["label"], o))
+        STATE["sent"].add(kstart)
+        save_sent()
+        log.info("напоминание про %s отменено: еда объявлена в Ноябриках раньше плана", meal)
+        await send_pair("По Ноябрикам %s уже начался (план был в %s) — напоминание отменено."
+                        % (e["label"], e["when"].strftime("%H:%M")))
+
+
+def _rule_route(text):
+    """Старые правила: ИиКТ — икт/информатикам; ИКТ-бтл — икт; общие — везде."""
+    low = (text or "").lower()
+    aud = CFG.get("audience", {})
+    ict = any(k in low for k in aud.get("ict", []))
+    # прямой адрес «икт/информатикам» — важен даже без ключей is_important
+    if not is_important(low) and not ict:
+        return None
+    other = any(k in low for k in aud.get("other", []))
+    strict = any(k in low for k in aud.get("ict_strict", []))
+    general = (any(k in low for k in aud.get("general", []))
+               or not (ict or other))
+    r = {"group": bool(ict or general),
+         "extra": bool(strict or general)}
+    if not (r["group"] or r["extra"]):
+        return None   # например «биотехнологии ждём» — никому из наших
+    return r
+
+
+ROUTE_MODEL = None
+
+
+def load_route_model():
+    global ROUTE_MODEL
+    p = ROOT / "ml" / "route_model.bin"
+    if not p.exists():
+        log.warning("route-модель не найдена (%s) — работают правила", p)
+        return
+    try:
+        sys.path.insert(0, str(ROOT / "ml"))
+        from route_model import RouteModel
+        ROUTE_MODEL = RouteModel(str(p))
+        log.info("route-модель загружена (%s, val macroF1 %.3f, train %s)",
+                 ROUTE_MODEL.meta.get("algo"),
+                 ROUTE_MODEL.meta.get("val_macro_f1", -1),
+                 ROUTE_MODEL.meta.get("n_train"))
+    except Exception as e:
+        log.warning("route-модель не загрузилась: %s", e)
+
+
+def route(text):
+    """Куда пересылать: {"group": ИиКТ, "extra": ИКТ-бтл} или None.
+    Решает нейронка (ml/route_model.bin), guard'ы — как в bbot:
+    исключения (конкурс и т.п.) рубят всегда, правила подстраховывают recall."""
+    low = (text or "").lower()
+    if any(p in low for p in CFG["transfer_exclude"]):
+        return None
+    if any(k in low for k in CFG.get("meal_force", [])):
+        return {"group": True, "extra": True}   # еда — всегда в оба чата
+    if ROUTE_MODEL is None:
+        return _rule_route(text)
+    label, probs = ROUTE_MODEL.predict(text)
+    mr = {"both": {"group": True, "extra": True},
+          "group": {"group": True, "extra": False},
+          "none": None}.get(label)
+    if mr is None:
+        mr = _rule_route(text)   # правила спасают recall на важных постах
+    log.info("route ml: %s %s -> %s", label, probs, "отправка" if mr else "скип")
+    return mr
+
+
+async def send_pair(text):
+    """Напоминания/уведомления о событиях: чат с /тихо не получает их."""
+    if DRY:
+        log.info("[DRY] %s", text.replace("\n", " / ")[:160])
+        return
+    for chat in TARGETS:
+        if chat in STATE["muted"]:
+            continue
+        try:
+            await bot.send_message(chat, text)
+        except Exception as e:
+            log.warning("не отправил в %s: %s", chat, e)
+
+
+# ───────────────────────── СИР и МЭС ─────────────────────────
+
+USERS_FILE = ROOT / "sessions" / ".users.json"
+SIR_FILE = ROOT / "sessions" / ".sir.json"
+BOT_LINK = "https://t.me/rivalikt_bot"
+ACTS = ["учебная", "трудовая", "спортивная", "познавательная"]
+MOODS = [("🟢", "отличное"), ("🟡", "хорошее"), ("🔵", "спокойное"), ("🔴", "грустное")]
+FIO_RE = re.compile(r"^[А-ЯЁа-яё]+(?:-[А-ЯЁа-яё]+)?$")
+
+
+def load_users():
+    try:
+        STATE["users"] = json.loads(USERS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        STATE["users"] = {}
+
+
+def save_users():
+    try:
+        USERS_FILE.write_text(json.dumps(STATE["users"], ensure_ascii=False, indent=1),
+                              encoding="utf-8")
+    except Exception:
+        pass
+
+
+def load_sir():
+    try:
+        STATE["sir"] = json.loads(SIR_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        STATE["sir"] = {}
+    today = dt.date.today().isoformat()
+    if STATE["sir"].get("date") != today:          # новый день — чистый лист
+        STATE["sir"] = {"date": today, "filled": {}, "slots": []}
+
+
+def save_sir():
+    try:
+        SIR_FILE.write_text(json.dumps(STATE["sir"], ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def sir_mention(pid, username, name):
+    """HTML: у зарегистрированных — эмодзи-ссылка на юзера, иначе @юз / имя."""
+    prof = STATE["users"].get(str(pid))
+    if prof and prof.get("emoji"):
+        return '<a href="tg://user?id=%d">%s</a>' % (pid, prof["emoji"])
+    if username:
+        return "@" + username
+    return (name or "юзер").strip() or "юзер"
+
+
+async def sir_people():
+    """Участники ИиКТ без тимлидов и ботов: {uid: {username, name}}. Кеш 10 мин."""
+    cache = STATE.get("people_cache")
+    if cache and time.time() - cache[0] < 600:
+        return cache[1]
+    people = {}
+    try:
+        async for p in ub.iter_participants(GROUP):
+            u = p.user
+            if getattr(u, "bot", False) or getattr(u, "deleted", False):
+                continue
+            part = getattr(p, "participant", None)
+            rank = getattr(part, "rank", None) or ""
+            skip = bool(getattr(part, "admin_rights", None)) or "тимлид" in rank.lower()
+            if skip:
+                continue
+            people[u.id] = {"username": getattr(u, "username", None),
+                            "name": ((getattr(u, "first_name", "") or "") + " "
+                                     + (getattr(u, "last_name", "") or "")).strip()}
+    except Exception as e:
+        log.warning("не смог получить участников для СИР: %s", e)
+        return cache[1] if cache else {}
+    STATE["people_cache"] = (time.time(), people)
+    return people
+
+
+async def sir_round():
+    """Напоминание: счёт в ИиКТ + ЛС каждому не прошедшему."""
+    people = await sir_people()
+    if not people:
+        return
+    filled = STATE["sir"].get("filled", {})
+    missed = [dict(v, id=k) for k, v in people.items() if str(k) not in filled]
+    if not missed:
+        log.info("СИР и МЭС: все заполнили (%d)", len(people))
+        return
+    names = "\n".join("• " + sir_mention(u["id"], u["username"], u["name"]) for u in missed)
+    text = "%d/%d не заполнили сир и мэс сегодня\nНе прошли:\n%s" % (
+        len(missed), len(people), names)
+    if DRY:
+        log.info("[DRY] СИР: %s", text.replace("\n", " / ")[:160])
+    else:
+        await bot.send_message(GROUP, text, parse_mode="html",
+                               buttons=[[Button.url("Перейти к боту", BOT_LINK)]])
+        for u in missed:
+            try:
+                await bot.send_message(u["id"],
+                                       "Не забудь заполнить сир и мэс. Заполнить: /сир")
+            except Exception:
+                pass
+
+
+async def sir_loop():
+    """«x/20 не заполнили…» несколько раз на дню — по расписанию из config."""
+    while True:
+        try:
+            if STATE.get("sir") and not DRY:
+                slot = dt.datetime.now().strftime("%H:%M")
+                if slot in CFG.get("sir_times", []) and slot not in STATE["sir"].get("slots", []):
+                    STATE["sir"].setdefault("slots", []).append(slot)
+                    save_sir()
+                    await sir_round()
+        except Exception:
+            log.exception("ошибка напоминаний СИР")
+        await asyncio.sleep(30)
+
+
+def act_keyboard():
+    return [[Button.inline(a, ("siract:" + a).encode())] for a in ACTS]
+
+
+def mood_keyboard():
+    return [[Button.inline("%s %s" % (e, m), ("sirmood:%s|%s" % (e, m)).encode())]
+            for e, m in MOODS]
+
+
+async def sir_launch(uid, send):
+    """Следующий шаг заполнения в ЛС. send = an отправщик (ev.reply / dm)."""
+    prof = STATE["users"].get(str(uid)) or {}
+    if not prof.get("name"):
+        STATE["sir_session"] = STATE.get("sir_session") or {}
+        STATE["sir_session"][uid] = {"stage": "fio"}
+        await send("Фамилия и имя через пробел (например: Иванов Иван).\n"
+                   "Ровно два слова, только русские буквы.")
+        return
+    if not prof.get("emoji"):
+        STATE["sir_session"] = STATE.get("sir_session") or {}
+        STATE["sir_session"][uid] = {"stage": "emoji"}
+        await send("Отправь эмодзи, которым тебя удобно упоминать в чатах.")
+        return
+    STATE["sir_session"].pop(uid, None)
+    await send("Выбери свою деятельность:", buttons=act_keyboard())
+
+
+
+# ───────────────────────── пересылка Ноябриков ─────────────────────────
+
+async def process_channel_message(m):
+    """Маршрутизация и отправка одного поста Ноябриков (нового или пропущенного)."""
+    if m is None or m.action is not None:
+        return
+    text = m.message or ""
+    if m.id in STATE["seen"]:
+        return
+    r = route(text)
+    if not r:
+        STATE["seen"].add(m.id)
+        save_seen()
+        return
+
+    when = m.date.astimezone().strftime("%d.%m %H:%M")
+    caption = "Ноябрики · %s" % when
+    if text:
+        caption += "\n\n" + text
+    if is_duplicate(caption):
+        log.info("дубль [%s] — скип", m.id)
+        STATE["seen"].add(m.id)
+        save_seen()
+        return
+    log.info("пересылаю [%s] (ИиКТ=%s, ИКТ-бтл=%s) %.60s",
+             m.id, r["group"], r["extra"], text)
+
+    if DRY:
+        log.info("[DRY] переслал бы: %s", caption.replace("\n", " / ")[:160])
+        return
+
+    targets = [OWNER]
+    if r["group"]:
+        targets.append(GROUP)
+    if r["extra"]:
+        targets += EXTRA_GROUPS
+    if not (r["group"] or r["extra"]):
+        STATE["seen"].add(m.id)
+        save_seen()
+        return   # ни одному чату не нужно — и себе не шлём
+
+    # медиа скачиваем в файл с правильным расширением (raw m.media бот шлём не умеет)
+    media_path = None
+    if m.photo or m.video or m.video_note or m.gif:
+        try:
+            d = ROOT / ".run" / "media"
+            d.mkdir(parents=True, exist_ok=True)
+            media_path = await m.download_media(file=str(d / "media"))
+        except Exception as e:
+            log.warning("медиа не скачалось: %s", e)
+
+    try:
+        ok = True
+        for chat in targets:
+            try:
+                if media_path:
+                    await bot.send_file(chat, media_path, caption=caption)
+                else:
+                    await bot.send_message(chat, caption)
+            except Exception as e:
+                ok = False
+                log.warning("не отправил в %s: %s", chat, e)
+    finally:
+        if media_path:
+            try:
+                os.remove(media_path)
+            except OSError:
+                pass
+    if ok:
+        STATE["seen"].add(m.id)
+        save_seen()
+    await adjust_meal_reminder(text)
+
+
+@ub.on(events.NewMessage(chats=CHANNEL))
+async def on_channel(ev):
+    await process_channel_message(ev.message)
+
+
+async def catchup():
+    """Догоняем посты, пришедшие пока бот был выключен/перезапускался."""
+    try:
+        msgs = await ub.get_messages(CHANNEL, limit=40)
+    except Exception as e:
+        log.warning("catch-up не смог прочитать Ноябрики: %s", e)
+        return
+    now = dt.datetime.now(dt.timezone.utc)
+    for m in reversed(list(msgs)):
+        if not m or not (m.message or "").strip():
+            continue
+        if m.id in STATE["seen"]:
+            continue
+        age_min = (now - m.date).total_seconds() / 60
+        if age_min > 90:
+            continue
+        log.info("catch-up: [%s] %.0f мин назад", m.id, age_min)
+        await process_channel_message(m)
+
+
+# ───────────────────────── ПЛАНЧИК ─────────────────────────
+
+@ub.on(events.NewMessage(chats=GROUPS))
+async def on_plan(ev):
+    t = ev.raw_text or ""
+    if not re.search(r"планчик\s+на\s+\d{1,2}\.\d{1,2}", t, re.I):
+        return
+    p = planmod.parse_plan(t, ev.message.date.astimezone(), CFG)
+    if not p["events"]:
+        return
+    STATE["plan"] = p
+    log.info("планчик на %s: %d событий", p["date"].strftime("%d.%m"), len(p["events"]))
+
+
+async def load_plan():
+    msgs = []
+    for gid in GROUPS:
+        try:
+            found = await ub.get_messages(gid, limit=400)
+        except Exception as e:
+            log.warning("не смог прочитать %s: %s", gid, e)
+            continue
+        for m in found:
+            if not m or (m.message or "").startswith("Ноябрики ·"):
+                continue
+            if getattr(m.sender, "bot", False):
+                continue                      # ответы самого бота (/plan) — не планчик
+            txt = m.message or ""
+            if not (planmod.DATE_RE.search(txt) or planmod.DATE_HEAD_RE.match(txt.splitlines()[0].strip() if txt else "")
+                    or sum(1 for ln in txt.splitlines() if planmod.LINE_RE.match(ln) or planmod.RANGE_RE.match(ln)) >= 5):
+                continue
+            msgs.append(m)
+    if not msgs:
+        log.warning("планчик не найден в чатах")
+        return
+    for m in sorted(msgs, key=lambda x: x.date, reverse=True):
+        p = planmod.parse_plan(m.message, m.date.astimezone(), CFG)
+        if not p["events"]:
+            continue                      # «Планчик на 31.10» в ответе бота — не планчик
+        STATE["plan"] = p
+        log.info("загружен планчик на %s: %d событий", p["date"].strftime("%d.%m"), len(p["events"]))
+        return
+    log.warning("планчик с событиями не найден в чатах")
+
+
+# ───────────────────────── напоминания ─────────────────────────
+
+def offset_for(ev):
+    return 5 if ev["kind"] == "five" else 30
+
+
+def base_time(ev):
+    g = ev.get("gather")
+    return g["time"] if g else ev["when"]
+
+
+def sec_name(s):
+    """профильная/олимпиадная → «профильная смена»; ИКТ/Инф — как есть."""
+    if not s:
+        return ""
+    return "%s смена" % s if s in ("профильная", "олимпиадная") else s
+
+
+def render(ev, off=5, start=False):
+    when = base_time(ev)
+    t = when.strftime("%H:%M")
+    sec = " (%s)" % sec_name(ev["section"]) if (ev["kind"] == "school" and ev.get("section")) else ""
+    if start:
+        msg = "Началось: %s (%s)" % (ev["label"], t)
+    else:
+        msg = "Через %d мин — %s%s (%s)" % (off, ev["label"], sec, t)
+    if not start and ev["kind"] == "school" and ev.get("gather"):
+        msg += "\n\nСбор: %s" % ev["gather"]["text"]
+    return msg
+
+
+async def scan_gather(now):
+    p = STATE["plan"]
+    if not p:
+        return
+    window = dt.timedelta(hours=CFG.get("gather_window_hours", 3))
+    pending = [e for e in p["events"]
+               if e["kind"] == "school" and not e.get("gather")
+               and now - dt.timedelta(minutes=30) < e["when"] < now + window]
+    if not pending:
+        return
+    try:
+        msgs = await ub.get_messages(CHANNEL, limit=CFG.get("gather_scan_limit", 60))
+    except Exception:
+        return
+    for e in pending:
+        kw = "школ" if "школ" in e["label"].lower() else "улк"
+        day_start = dt.datetime.combine(e["when"].date(), dt.time(0, 0))
+        for m in msgs:
+            t = m.message or ""
+            if kw not in t.lower():
+                continue
+            if m.date and m.date.astimezone().replace(tzinfo=None) < day_start:
+                continue          # только сегодняшние посты, не вчерашние
+            tm = planmod.gather_time(t)
+            if not tm:
+                continue
+            cand = dt.datetime.combine(e["when"].date(), dt.time(*tm))
+            if abs((cand - e["when"]).total_seconds()) > 2 * 3600:
+                continue
+            e["gather"] = {"time": cand, "text": t.strip()[:200]}
+            log.info("точный сбор для %r: %s", e["label"], cand.strftime("%H:%M"))
+            break
+
+
+async def scheduler():
+    while True:
+        try:
+            now = dt.datetime.now()
+            p = STATE["plan"]
+            if p:
+                for e in p["events"]:
+                    if not e["kind"]:
+                        continue
+                    base = base_time(e)
+                    # напоминания заранее: школа за 30 мин, все события за 5 мин
+                    offs = [30, 5] if e["kind"] == "school" else [5]
+                    for off in offs:
+                        okey = "%s|%s|%d" % (base.isoformat(), e["label"], off)
+                        if okey in STATE["sent"]:
+                            continue
+                        rem = base - dt.timedelta(minutes=off)
+                        if now < rem or now > base:
+                            continue
+                        log.info("напоминание (%d мин): %s", off, e["label"])
+                        await send_pair(render(e, off=off))
+                        STATE["sent"].add(okey)
+                        save_sent()
+                    # старт события — сразу после наступления
+                    skey = "%s|%s|start" % (base.isoformat(), e["label"])
+                    if (skey not in STATE["sent"]
+                            and 0 <= (now - base).total_seconds() < 300):
+                        log.info("старт: %s", e["label"])
+                        await send_pair(render(e, start=True))
+                        STATE["sent"].add(skey)
+                        save_sent()
+            await scan_gather(now)
+        except Exception:
+            log.exception("ошибка планировщика")
+        await asyncio.sleep(20)
+
+
+async def poll_channel():
+    """Страховка: lив-ивенты канала иногда не приходят часами —
+    раз в 90 сек опрашиваем Ноябрики руками и прогоняем через обработчик."""
+    while True:
+        try:
+            msgs = await ub.get_messages(CHANNEL, limit=8)
+            now_utc = dt.datetime.now(dt.timezone.utc)
+            for m in reversed(msgs or []):
+                if m and m.message is not None:
+                    age = (now_utc - m.date).total_seconds()
+                    if 0 <= age < 600:          # только свежие (10 мин), seen режет дубли
+                        await process_channel_message(m)
+        except Exception:
+            log.exception("ошибка опроса канала")
+        await asyncio.sleep(90)
+
+
+# ───────────────────────── команды бота ─────────────────────────
+
+@bot.on(events.NewMessage(pattern=r"^/start(@\w+)?(\s|$)"))
+async def cmd_start(ev):
+    if ev.is_private:
+        await ev.reply("Привет! Я слежу за Ноябриками и ПЛАНЧИКом.\n"
+                       "Пересылаю важное в ЛС и в ИиКТ, напоминаю о событиях.\n\n"
+                       "/plan — план на день\n/next — ближайшее напоминание\n"
+                       "/тихо — выключить напоминания (в этом чате)\n"
+                       "/громко — включить напоминания обратно\n"
+                       "/vonyat — проверка: пинг и жив ли юзербот")
+
+
+@bot.on(events.NewMessage(pattern=r"^/тихо(@\w+)?(\s|$)"))
+async def cmd_mute(ev):
+    """Выключить напоминания о событиях в этом чате (в группах — только админы)."""
+    if not ev.is_private and not await _admin_only(ev):
+        await ev.reply("Команда только для админов.")
+        return
+    STATE["muted"].add(ev.chat_id)
+    save_muted()
+    log.info("уведомления выключены в %s", ev.chat_id)
+    await ev.reply("Напоминания о событиях выключены в этом чате. Вернуть: /громко.")
+
+
+@bot.on(events.NewMessage(pattern=r"^/громко(@\w+)?(\s|$)"))
+async def cmd_unmute(ev):
+    """Включить напоминания о событиях в этом чате обратно."""
+    if not ev.is_private and not await _admin_only(ev):
+        await ev.reply("Команда только для админов.")
+        return
+    STATE["muted"].discard(ev.chat_id)
+    save_muted()
+    log.info("уведомления включены в %s", ev.chat_id)
+    await ev.reply("Напоминания о событиях включены обратно.")
+
+
+@bot.on(events.NewMessage(pattern=r"^/(vonyat|вонять)(@\w+)?(\s|$)"))
+async def cmd_vonyat(ev):
+    lines = ["ИКТ тут", ""]
+
+    async def ping(client):
+        t0 = time.monotonic()
+        try:
+            await client(functions.help.GetConfigRequest())
+            return int((time.monotonic() - t0) * 1000)
+        except Exception:
+            return None
+
+    p_bot = await ping(bot)
+    lines.append("Telegram (бот): %s" % ("%d мс" % p_bot if p_bot is not None else "нет связи"))
+
+    connected = ub.is_connected()
+    authorized = connected and await ub.is_user_authorized()
+    p_ub = await ping(ub) if authorized else None
+    if authorized:
+        status = "жив, читает Ноябрики" if p_ub is not None else "подключён, но не отвечает"
+    else:
+        status = "не авторизован" if connected else "отключён"
+    lines.append("Юзербот: %s%s" % (status, (" (%d мс)" % p_ub) if p_ub is not None else ""))
+
+    await ev.reply("\n".join(lines))
+
+
+async def _admin_only(ev):
+    if ev.sender_id == OWNER:
+        return True
+    try:
+        return (await bot.get_permissions(ev.chat_id, ev.sender_id)).is_admin
+    except Exception:
+        return False
+
+
+async def _wash_target(ev, body):
+    """→ (target_id, entity, err). Цель — реплай на сообщение или @юзернейм."""
+    if ev.reply_to_msg_id:
+        rep = await ev.get_reply_message()
+        if rep and rep.sender:
+            if getattr(rep.sender, "bot", False):
+                return None, None, "Ботов не трогаю."
+            return rep.sender_id, rep.sender, None
+    m = re.search(r"@([A-Za-z0-9_]{4,})", body)
+    if m:
+        try:
+            ent = await bot.get_entity("@" + m.group(1))
+        except Exception:
+            return None, None, "Не нашёл @%s." % m.group(1)
+        if getattr(ent, "bot", False):
+            return None, None, "Ботов не трогаю."
+        return ent.id, ent, None
+    return None, None, None
+
+
+@bot.on(events.NewMessage(pattern=r"(?i)^помыть(\s|$)"))
+async def cmd_wash(ev):
+    """помыть [7 д|3 ч|15 м] [@цель] + причина отдельной строкой. Цель — реплай или @юзер."""
+    if not (ev.is_group or ev.is_channel):
+        return
+    if not await _admin_only(ev):
+        await ev.reply("Команда только для админов.")
+        return
+
+    lines = (ev.raw_text or "").splitlines()
+    body = lines[0].strip()[len("помыть"):].strip()
+    reason = "\n".join(x.strip() for x in lines[1:] if x.strip())
+
+    target, ent, err = await _wash_target(ev, body)
+    if err:
+        await ev.reply(err)
+        return
+    if target is None:
+        await ev.reply("Кого мыть? Реплай на сообщение или @юзернейм. Срок: 7 д / 3 ч / 15 м.")
+        return
+    if target == ev.sender_id:
+        await ev.reply("Себя не мою.")
+        return
+    try:
+        if (await bot.get_permissions(ev.chat_id, target)).is_admin:
+            await ev.reply("Админа не мою.")
+            return
+    except Exception:
+        pass
+
+    mult = {"д": 86400, "дн": 86400, "дней": 86400,
+            "ч": 3600, "час": 3600, "часов": 3600,
+            "м": 60, "мин": 60, "минут": 60, "минуты": 60}
+    dur = None
+    dm = re.search(r"(\d+)\s*([а-яa-z]+)", body, re.I)
+    if dm:
+        u = dm.group(2).lower()
+        if u not in mult:
+            await ev.reply("Не понял срок %r. Форматы: 7 д / 3 ч / 15 м." % dm.group(0))
+            return
+        dur = int(dm.group(1)) * mult[u]
+
+    ts = int(time.time()) + dur if dur else None
+    try:
+        ent = ent or await bot.get_entity(target)
+        await bot(functions.channels.EditBannedRequest(
+            ev.chat_id, ent,
+            types.ChatBannedRights(until_date=ts, view_messages=True)))
+    except Exception as e:
+        await ev.reply("Не вышло: %s (боту нужны права админа с баном)" % type(e).__name__)
+        return
+
+    who = ("@" + ent.username) if getattr(ent, "username", None) else (getattr(ent, "first_name", None) or str(target))
+    out = "Помыт: %s" % who
+    out += " до %s" % dt.datetime.fromtimestamp(ts).strftime("%d.%m %H:%M") if ts else " навсегда"
+    if reason:
+        out += "\nПричина: %s" % reason
+    log.info("помыт %s в %s (до %s, причина: %s)", target, ev.chat_id, ts, reason or "-")
+    await ev.reply(out)
+
+
+@bot.on(events.NewMessage(pattern=r"(?i)^разбан(\s|$)"))
+async def cmd_unwash(ev):
+    if not (ev.is_group or ev.is_channel):
+        return
+    if not await _admin_only(ev):
+        await ev.reply("Команда только для админов.")
+        return
+    body = (ev.raw_text or "").splitlines()[0].strip()[len("разбан"):].strip()
+    target, ent, err = await _wash_target(ev, body)
+    if err:
+        await ev.reply(err)
+        return
+    if target is None:
+        await ev.reply("Кого разбанить? Реплай на сообщение или @юзернейм.")
+        return
+    try:
+        ent = ent or await bot.get_entity(target)
+        await bot(functions.channels.EditBannedRequest(
+            ev.chat_id, ent, types.ChatBannedRights(until_date=None)))
+    except Exception as e:
+        await ev.reply("Не вышло: %s (нужны права админа с баном)" % type(e).__name__)
+        return
+    who = ("@" + ent.username) if getattr(ent, "username", None) else (getattr(ent, "first_name", None) or str(target))
+    log.info("разбан %s в %s", target, ev.chat_id)
+    await ev.reply("Разбанен: %s" % who)
+
+
+@bot.on(events.NewMessage(pattern=r"^/plan(@\w+)?(\s|$)"))
+async def cmd_plan(ev):
+    p = STATE["plan"]
+    if not p or not p.get("events"):
+        await load_plan()
+        p = STATE["plan"]
+    if not p or not p.get("events"):
+        await ev.reply("Планчик не найден в ИиКТ.")
+        return
+    lines = ["Планчик на %s" % p["date"].strftime("%d.%m")]
+    last_sec = "INIT"
+    for e in p["events"]:
+        sec = e.get("section")
+        if sec != last_sec:
+            lines.append("")
+            if sec:
+                lines.append("%s:" % sec_name(sec))
+            last_sec = sec
+        add = ""
+        if e.get("gather"):
+            add = "  (сбор %s)" % e["gather"]["time"].strftime("%H:%M")
+        lines.append("%s — %s%s" % (e["when"].strftime("%H:%M"), e["label"], add))
+    while lines and not lines[0]:
+        lines.pop(0)
+    await ev.reply("\n".join(lines))
+
+
+@bot.on(events.NewMessage(pattern=r"^/all(@\w+)?(\s|$)"))
+async def cmd_all(ev):
+    if not (ev.is_group or ev.is_channel):
+        await ev.reply("Эта команда работает в группе.")
+        return
+    try:
+        users = []
+        async for u in ub.iter_participants(ev.chat_id):
+            if getattr(u, "bot", False) or getattr(u, "deleted", False):
+                continue
+            if getattr(u, "username", None):
+                users.append("@" + u.username)
+    except Exception as e:
+        await ev.reply("Не могу получить участников: %s" % type(e).__name__)
+        return
+
+    seen, uniq = set(), []
+    for u in users:
+        if u.lower() not in seen:
+            seen.add(u.lower())
+            uniq.append(u)
+    if not uniq:
+        await ev.reply("В чате нет участников с юзернеймами.")
+        return
+
+    chunks, cur = [], ""
+    for u in uniq:
+        if len(cur) + len(u) + 1 > 3500:
+            chunks.append(cur)
+            cur = ""
+        cur += ("\n" if cur else "") + u
+    chunks.append(cur)
+
+    for c in chunks:
+        await ev.reply(c)
+
+
+@bot.on(events.NewMessage(pattern=r"^/next(@\w+)?(\s|$)"))
+async def cmd_next(ev):
+    p = STATE["plan"]
+    now = dt.datetime.now()
+    if not p:
+        await ev.reply("Планчик пока не найден.")
+        return
+    upcoming = [e for e in p["events"] if e["kind"] and base_time(e) > now]
+    if not upcoming:
+        await ev.reply("На сегодня напоминаний больше нет.")
+        return
+    e = upcoming[0]
+    await ev.reply("Следующее: %s\nНапомню в %s" % (
+        e["label"], (base_time(e) - dt.timedelta(minutes=offset_for(e))).strftime("%H:%M")))
+
+
+# ───────────────────────── main ─────────────────────────
+
+async def main():
+    if not acquire_lock():
+        return
+    try:
+        await _run()
+    finally:
+        release_lock()
+
+
+async def _run():
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s",
+                        datefmt="%H:%M:%S")
+    load_sent()
+    load_seen()
+    load_muted()
+
+    await bot.start(bot_token=ENV["BOT_TOKEN"])
+    await ub.connect()
+    if not await ub.is_user_authorized():
+        log.error("юзербот (sessions/ikt-bot) не авторизован")
+        return
+
+    load_route_model()
+    await load_plan()
+    await catchup()
+
+    if "--test" in sys.argv:
+        p = STATE["plan"]
+        if p:
+            for e in p["events"]:
+                print("%s %-8s %-10s %s" % (e["when"].strftime("%d.%m %H:%M"), e["kind"], e["section"] or "-", e["label"]))
+        await scan_gather(dt.datetime.now())
+        print("dry-run ок")
+        return
+
+    log.info("работаю: канал=%s, группа=%s, владелец=%s", CHANNEL, GROUP, OWNER)
+    asyncio.create_task(scheduler())
+    asyncio.create_task(poll_channel())
+    await asyncio.gather(bot.run_until_disconnected(), ub.run_until_disconnected())
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
