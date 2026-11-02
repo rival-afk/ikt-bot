@@ -350,16 +350,15 @@ async def sir_people():
         return cache[1]
     people = {}
     try:
-        async for p in ub.iter_participants(GROUP):
-            u = p.user
+        # у Telethon iter_participants отдаёт User напрямую; тимлиды — админы группы
+        admin_ids = set()
+        async for u in ub.iter_participants(GROUP,
+                                            filter=types.ChannelParticipantsAdmins):
+            admin_ids.add(u.id)
+        async for u in ub.iter_participants(GROUP):
             if getattr(u, "bot", False) or getattr(u, "deleted", False):
                 continue
-            part = getattr(p, "participant", None)
-            skip = isinstance(part, (types.ChannelParticipantAdmin,
-                                     types.ChannelParticipantCreator))
-            rank = getattr(part, "rank", None) or ""
-            skip = skip or "тимлид" in rank.lower()
-            if skip:
+            if u.id in admin_ids:
                 continue
             people[u.id] = {"username": getattr(u, "username", None),
                             "name": ((getattr(u, "first_name", "") or "") + " "
@@ -379,8 +378,15 @@ async def sir_round():
     filled = STATE["sir"].get("filled", {})
     missed = [dict(v, id=k) for k, v in people.items() if str(k) not in filled]
     if not missed:
-        log.info("СИР и МЭС: все заполнили (%d)", len(people))
+        if not STATE["sir"].get("all_posted"):
+            STATE["sir"]["all_posted"] = True
+            save_sir()
+            if not DRY:
+                await bot.send_message(GROUP, "Все заполнили сир и мэс сегодня.")
+            log.info("СИР и МЭС: все заполнили (%d)", len(people))
         return
+    if STATE["sir"].get("all_posted"):
+        return   # уже оповестили «все заполнили» — не спамим разворотом
     names = "\n".join("• " + sir_mention(u["id"], u["username"], u["name"]) for u in missed)
     text = "%d/%d не заполнили сир и мэс сегодня\nНе прошли:\n%s" % (
         len(missed), len(people), names)
@@ -397,11 +403,36 @@ async def sir_round():
                 pass
 
 
+async def sir_rollover():
+    """Смена дня: чистый лист; не заполнивших за вчерашний день — списком в ИиКТ."""
+    today = dt.date.today().isoformat()
+    if STATE["sir"].get("date") == today:
+        return False
+    people = await sir_people()
+    filled = STATE["sir"].get("filled", {})
+    late = [dict(v, id=k) for k, v in (people or {}).items() if str(k) not in filled]
+    STATE["sir"] = {"date": today, "filled": {}, "slots": [], "all_posted": False}
+    save_sir()
+    if late:
+        names = "\n".join("• " + sir_mention(u["id"], u["username"], u["name"]) for u in late)
+        text = "Не заполнили сир и мэс за прошлый день:\n%s" % names
+        if DRY:
+            log.info("[DRY] СИР-ролловер: %s", text.replace("\n", " / ")[:160])
+        else:
+            try:
+                await bot.send_message(GROUP, text, parse_mode="html")
+            except Exception as e:
+                log.warning("ролловер СИР не ушел: %s", e)
+        log.info("СИР: %d не заполнили прошлый день", len(late))
+    return True
+
+
 async def sir_loop():
-    """«x/20 не заполнили…» несколько раз на дню — по расписанию из config."""
+    """Раунды СИР/МЭС: 8:30, 9:15, 22:00; смена дня — №00:00 списко разборща."""
     while True:
         try:
             if STATE.get("sir") and not DRY:
+                await sir_rollover()
                 slot = dt.datetime.now().strftime("%H:%M")
                 if slot in CFG.get("sir_times", []) and slot not in STATE["sir"].get("slots", []):
                     STATE["sir"].setdefault("slots", []).append(slot)
