@@ -581,6 +581,12 @@ async def process_channel_message(m):
         STATE["seen"].add(m.id)
         save_seen()
         return
+    # пересылка Ноябриков отключена — только служебная реакция (сдвиг/отмена еды)
+    if not CFG.get("transfer_noyabrki", True):
+        STATE["seen"].add(m.id)
+        save_seen()
+        await adjust_meal_reminder(text)
+        return
 
     when = m.date.astimezone().strftime("%d.%m %H:%M")
     caption = "Ноябрики · %s" % when
