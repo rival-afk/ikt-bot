@@ -461,7 +461,8 @@ def mood_keyboard():
 
 
 async def sir_launch(uid, send):
-    """Следующий шаг заполнения в ЛС. send = an отправщик (ev.reply / dm)."""
+    """Следующий шаг заполнения в ЛС. send = функция отправки (ev.reply / dm)."""
+    STATE["sir_session"] = STATE.get("sir_session") or {}
     prof = STATE["users"].get(str(uid)) or {}
     if not prof.get("name"):
         STATE["sir_session"] = STATE.get("sir_session") or {}
