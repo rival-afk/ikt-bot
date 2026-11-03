@@ -376,8 +376,10 @@ async def sir_round():
     people = await sir_people()
     if not people:
         return
+    opted = {int(k) for k, v in STATE["users"].items() if v.get("nosir")}
     filled = STATE["sir"].get("filled", {})
-    missed = [dict(v, id=k) for k, v in people.items() if str(k) not in filled]
+    missed = [dict(v, id=k) for k, v in people.items()
+              if str(k) not in filled and k not in opted]
     if not missed:
         if not STATE["sir"].get("all_posted"):
             STATE["sir"]["all_posted"] = True
@@ -411,8 +413,10 @@ async def sir_rollover():
     if STATE["sir"].get("date") == today:
         return False
     people = await sir_people()
+    opted = {int(k) for k, v in STATE["users"].items() if v.get("nosir")}
     filled = STATE["sir"].get("filled", {})
-    late = [dict(v, id=k) for k, v in (people or {}).items() if str(k) not in filled]
+    late = [dict(v, id=k) for k, v in (people or {}).items()
+            if str(k) not in filled and k not in opted]
     STATE["sir"] = {"date": today, "filled": {}, "slots": [], "all_posted": False}
     save_sir()
     # вчерашний планчик moves в prev_plan, обновления ждут нового
@@ -436,7 +440,10 @@ async def sir_rollover():
 
 
 async def sir_loop():
-    """Раунды СИР/МЭС: 8:30, 9:15, 22:00; смена дня — №00:00 списко разборща."""
+    """Раунды СИР/МЭС: 20:30, 21:15, 22:00, 23:00; смена дня — разбор в 00:00."""
+    if not CFG.get("sir_enabled", True):
+        log.info("сир и мэс отключены глобально (sir_enabled=false)")
+        return
     while True:
         try:
             if STATE.get("sir") and not DRY:
@@ -465,17 +472,23 @@ async def sir_launch(uid, send):
     STATE["sir_session"] = STATE.get("sir_session") or {}
     prof = STATE["users"].get(str(uid)) or {}
     if not prof.get("name"):
-        STATE["sir_session"] = STATE.get("sir_session") or {}
         STATE["sir_session"][uid] = {"stage": "fio"}
         await send("Фамилия и имя через пробел (например: Иванов Иван).\n"
                    "Ровно два слова, только русские буквы.")
         return
     if not prof.get("emoji"):
-        STATE["sir_session"] = STATE.get("sir_session") or {}
         STATE["sir_session"][uid] = {"stage": "emoji"}
-        await send("Отправь эмодзи, которым тебя удобно упоминать в чатах.")
+        if prof.get("nosir"):
+            await send("Отправь эмодзи, которым тебя удобно упоминать в чатах — "
+                       "это всё, что нужно (сир и мэс отключены).")
+        else:
+            await send("Отправь эмодзи, которым тебя удобно упоминать в чатах.")
         return
     STATE["sir_session"].pop(uid, None)
+    if prof.get("nosir"):
+        await send("Готово: тебя можно упоминать эмодзи %s. Сир и мэс отключены."
+                   % prof["emoji"])
+        return
     await send("Выбери свою деятельность:", buttons=act_keyboard())
 
 
@@ -490,6 +503,25 @@ async def cmd_sir(ev):
         except Exception:
             pass
         return
+    # /sir — это согласие на заполнение: личное отключение снимаем
+    STATE["users"].setdefault(str(ev.sender_id), {}).pop("nosir", None)
+    save_users()
+    await sir_launch(ev.sender_id, ev.reply)
+
+
+@bot.on(events.NewMessage(pattern=r"^/nosir(@\w+)?(\s|$)"))
+async def cmd_nosir(ev):
+    """Отключить сир и мэс для себя — остаётся только выбор эмодзи."""
+    if not ev.is_private:
+        try:
+            await ev.reply("/nosir работает только в ЛС с ботом.",
+                           buttons=[[Button.url("Открыть бота", BOT_LINK)]])
+        except Exception:
+            pass
+        return
+    STATE["users"].setdefault(str(ev.sender_id), {})["nosir"] = True
+    save_users()
+    log.info("сир и мэс отключены для %s", ev.sender_id)
     await sir_launch(ev.sender_id, ev.reply)
 
 
@@ -891,6 +923,7 @@ async def cmd_start(ev):
                        "/dont-notify — выключить напоминания (в этом чате)\n"
                        "/notify — включить напоминания обратно\n"
                        "/sir — заполнить сир и мэс\n"
+                       "/nosir — отключить сир и мэс (только эмодзи)\n"
                        "/vonyat — проверка: пинг и жив ли юзербот")
 
 

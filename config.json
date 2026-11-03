@@ -134,5 +134,6 @@
     "22:00",
     "23:00"
   ],
-  "transfer_noyabrki": false
+  "transfer_noyabrki": false,
+  "sir_enabled": false
 }
