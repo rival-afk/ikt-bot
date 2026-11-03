@@ -1078,8 +1078,7 @@ async def cmd_all(ev):
         return
     items, seen = [], set()
     try:
-        async for p in ub.iter_participants(ev.chat_id):
-            u = p.user
+        async for u in ub.iter_participants(ev.chat_id):
             if getattr(u, "bot", False) or getattr(u, "deleted", False):
                 continue
             prof = STATE["users"].get(str(u.id))
