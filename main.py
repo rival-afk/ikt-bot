@@ -824,6 +824,30 @@ async def poll_channel():
 
 # ───────────────────────── команды бота ─────────────────────────
 
+@bot.on(events.NewMessage(chats=GROUP))
+async def plan_watch(ev):
+    """Новый планчик emitter в ИиКТ — сразу загружаем (не дожидаясь рестарта)."""
+    txt = ev.raw_text or ""
+    if not txt or txt.startswith("Ноябрики ·"):
+        return
+    if getattr(ev.sender, "bot", False):
+        return
+    first = txt.splitlines()[0].strip() if txt else ""
+    timed = sum(1 for ln in txt.splitlines()
+                if planmod.LINE_RE.match(ln) or planmod.RANGE_RE.match(ln))
+    if not (planmod.DATE_RE.search(txt) or planmod.DATE_HEAD_RE.match(first)) or timed < 5:
+        return
+    p = planmod.parse_plan(txt, ev.message.date.astimezone(), CFG)
+    if len(p["events"]) < 5:
+        return
+    old = STATE["plan"]
+    if old and p["date"] <= old["date"]:
+        return                      # старый планчик / тот же день — не трогаем
+    STATE["plan"] = p
+    log.info("планчик на %s принят из чата: %d событий",
+             p["date"].strftime("%d.%m"), len(p["events"]))
+
+
 @bot.on(events.NewMessage(pattern=r"^/start(@\w+)?(\s|$)"))
 async def cmd_start(ev):
     if ev.is_private:
