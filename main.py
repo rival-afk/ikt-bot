@@ -703,7 +703,10 @@ async def load_plan():
         log.warning("планчик не найден в чатах")
         return
     for m in sorted(msgs, key=lambda x: x.date, reverse=True):
-        p = planmod.parse_plan(m.message, m.date.astimezone(), CFG)
+        try:
+            p = planmod.parse_plan(m.message, m.date.astimezone(), CFG)
+        except Exception:
+            continue                      # битый «похожий на планчик» пост не убивает бот
         if not p["events"]:
             continue                      # «Планчик на 31.10» в ответе бота — не планчик
         accept_plan(p)
@@ -854,7 +857,10 @@ async def plan_watch(ev):
                 if planmod.LINE_RE.match(ln) or planmod.RANGE_RE.match(ln))
     if not (planmod.DATE_RE.search(txt) or planmod.DATE_HEAD_RE.match(first)) or timed < 5:
         return
-    p = planmod.parse_plan(txt, ev.message.date.astimezone(), CFG)
+    try:
+        p = planmod.parse_plan(txt, ev.message.date.astimezone(), CFG)
+    except Exception:
+        return
     if len(p["events"]) < 5:
         return
     old = STATE["plan"]

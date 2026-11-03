@@ -28,22 +28,18 @@ def classify(label, cfg):
 def parse_plan(text, posted_at, cfg):
     """→ dict(date=date, events=[{when, label, kind, section}])"""
     common = cfg.get("common_events", [])
+    day = month = None
     m = DATE_RE.search(text or "")
     if m:
         day, month = int(m.group(1)), int(m.group(2))
     else:
         # «🌸02.11🌸» заголовком, без слова ПЛАНЧИК
-        m = None
         for raw in (text or "").splitlines()[:3]:
             hm = DATE_HEAD_RE.match(raw.strip())
             if hm:
-                m = hm
+                day, month = int(hm.group(1)), int(hm.group(2))
                 break
-        if not m:
-            date = posted_at.date() + dt.timedelta(days=1)
-        else:
-            day, month = int(m.group(1)), int(m.group(2))
-    if m:
+    if day and month and 1 <= month <= 12 and 1 <= day <= 31:
         year = posted_at.year
         date = dt.date(year, month, day)
         # планчик на 31.12, опубликован 30.12 — ок; на 01.01 — следующий год
