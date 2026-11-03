@@ -48,6 +48,7 @@ ub = TelegramClient(str(ROOT / "sessions" / "ikt-bot"), API_ID, API_HASH,
 
 STATE = {
     "plan": None,          # {"date": date, "events": [...]}
+    "prev_plan": None,     # прошлый планчик — держим в памяти
     "seen": set(),         # id сообщений Ноябриков
     "sent": set(),         # ключи отправленных напоминаний
 }
@@ -414,6 +415,12 @@ async def sir_rollover():
     late = [dict(v, id=k) for k, v in (people or {}).items() if str(k) not in filled]
     STATE["sir"] = {"date": today, "filled": {}, "slots": [], "all_posted": False}
     save_sir()
+    # вчерашний планчик moves в prev_plan, обновления ждут нового
+    pl = STATE.get("plan")
+    if pl and pl["date"].isoformat() < today:
+        STATE["prev_plan"] = pl
+        STATE["plan"] = None
+        log.info("прошлый план (%s) сохранён в prev_plan", pl["date"].strftime("%d.%m"))
     if late:
         names = "\n".join("• " + sir_mention(u["id"], u["username"], u["name"]) for u in late)
         text = "Не заполнили сир и мэс за прошлый день:\n%s" % names
@@ -666,9 +673,10 @@ async def on_plan(ev):
     if not re.search(r"планчик\s+на\s+\d{1,2}\.\d{1,2}", t, re.I):
         return
     p = planmod.parse_plan(t, ev.message.date.astimezone(), CFG)
-    if not p["events"]:
+    old = STATE["plan"]
+    if len(p["events"]) < 5 or (old and p["date"] < old["date"]):
         return
-    STATE["plan"] = p
+    accept_plan(p)
     log.info("планчик на %s: %d событий", p["date"].strftime("%d.%m"), len(p["events"]))
 
 
@@ -697,13 +705,21 @@ async def load_plan():
         p = planmod.parse_plan(m.message, m.date.astimezone(), CFG)
         if not p["events"]:
             continue                      # «Планчик на 31.10» в ответе бота — не планчик
-        STATE["plan"] = p
+        accept_plan(p)
         log.info("загружен планчик на %s: %d событий", p["date"].strftime("%d.%m"), len(p["events"]))
         return
     log.warning("планчик с событиями не найден в чатах")
 
 
 # ───────────────────────── напоминания ─────────────────────────
+
+def accept_plan(p):
+    """План заменяет текущий, прежний остаётся в памяти (prev_plan)."""
+    old = STATE.get("plan")
+    if old is not None and old is not p:
+        STATE["prev_plan"] = old
+    STATE["plan"] = p
+
 
 def offset_for(ev):
     return 5 if ev["kind"] == "five" else 30
@@ -841,9 +857,9 @@ async def plan_watch(ev):
     if len(p["events"]) < 5:
         return
     old = STATE["plan"]
-    if old and p["date"] <= old["date"]:
-        return                      # старый планчик / тот же день — не трогаем
-    STATE["plan"] = p
+    if old and p["date"] < old["date"]:
+        return                      # старый планчик — не трогаем
+    accept_plan(p)
     log.info("планчик на %s принят из чата: %d событий",
              p["date"].strftime("%d.%m"), len(p["events"]))
 
