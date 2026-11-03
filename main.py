@@ -525,6 +525,21 @@ async def cmd_nosir(ev):
     await sir_launch(ev.sender_id, ev.reply)
 
 
+@bot.on(events.NewMessage(pattern=r"^/emoji(@\w+)?(\s|$)"))
+async def cmd_emoji(ev):
+    """Выбор/перевыбор личного эмодзи — только в ЛС."""
+    if not ev.is_private:
+        try:
+            await ev.reply("/emoji работает только в ЛС с ботом.",
+                           buttons=[[Button.url("Открыть боту", BOT_LINK)]])
+        except Exception:
+            pass
+        return
+    STATE["sir_session"] = STATE.get("sir_session") or {}
+    STATE["sir_session"][ev.sender_id] = {"stage": "emoji", "only": True}
+    await ev.reply("Отправь эмодзи, которым тебя будут упоминать:")
+
+
 @bot.on(events.NewMessage)
 async def sir_pm(ev):
     """ЛС: машина состояний СИР/МЭС (имя, эмодзи, кнопки). Слэш-команды не трогаем."""
@@ -555,6 +570,10 @@ async def sir_pm(ev):
             return
         STATE["users"].setdefault(str(ev.sender_id), {})["emoji"] = text
         save_users()
+        if session.get("only"):               # /emoji — только перевыбор
+            STATE["sir_session"].pop(ev.sender_id, None)
+            await ev.reply("Принято: теперь тебя можно упоминать эмодзи %s." % text)
+            return
         await ev.reply("Принято.")
         await sir_launch(ev.sender_id, ev.reply)
         return
@@ -924,6 +943,7 @@ async def cmd_start(ev):
                        "/notify — включить напоминания обратно\n"
                        "/sir — заполнить сир и мэс\n"
                        "/nosir — отключить сир и мэс (только эмодзи)\n"
+                       "/emoji — выбрать эмодзи для упоминаний\n"
                        "/vonyat — проверка: пинг и жив ли юзербот")
 
 
