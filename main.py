@@ -1085,14 +1085,15 @@ async def cmd_all(ev):
             if prof and prof.get("emoji"):          # зарегистрированный — эмодзи-юз
                 mention = sir_mention(u.id, getattr(u, "username", None),
                                       getattr(u, "first_name", ""))
+                kind = "emoji"
             elif getattr(u, "username", None):
-                mention = "@" + u.username
+                mention, kind = "@" + u.username, "user"
             else:
                 continue                             # без юза и без регистрации не упомянуть
             if u.id in seen:
                 continue
             seen.add(u.id)
-            items.append(mention)
+            items.append((mention, kind))
     except Exception as e:
         await ev.reply("Не могу получить участников: %s" % type(e).__name__)
         return
@@ -1101,18 +1102,33 @@ async def cmd_all(ev):
         await ev.reply("В чате нет участников с юзернеймами.")
         return
 
-    chunks, cur, curlen = [], [], 0
-    for it in items:
-        if curlen + len(it) + 1 > 3500:
+    # эмодзи-юзы — по 5 в ряд через пробел, обычные @юзы — по одному на строке
+    lines, row = [], []
+    for mention, kind in items:
+        if kind == "emoji":
+            row.append(mention)
+            if len(row) == 5:
+                lines.append(" ".join(row))
+                row = []
+        else:
+            if row:
+                lines.append(" ".join(row))
+                row = []
+            lines.append(mention)
+    if row:
+        lines.append(" ".join(row))
+
+    chunks, cur, curlen = [], "", 0
+    for ln in lines:
+        if curlen + len(ln) + 1 > 3500:
             chunks.append(cur)
-            cur, curlen = [], 0
-        cur.append(it)
-        curlen += len(it) + 1
-    if cur:
-        chunks.append(cur)
+            cur, curlen = "", 0
+        cur += ("\n" if cur else "") + ln
+        curlen += len(ln) + 1
+    chunks.append(cur)
 
     for c in chunks:
-        await ev.reply("\n".join(c), parse_mode="html")
+        await ev.reply(c, parse_mode="html")
 
 
 @bot.on(events.NewMessage(pattern=r"^/next(@\w+)?(\s|$)"))
