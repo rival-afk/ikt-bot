@@ -581,7 +581,6 @@ async def sir_pm(ev):
     # без сессии: любое сообщение в ЛС с незаполненным СИР/МЭС — приглашение заполнить
     filled = STATE.get("sir", {}).get("filled", {})
     if str(ev.sender_id) not in filled and ev.sender_id in (await sir_people()):
-        STATE["sir_session"].pop(ev.sender_id, None)
         await sir_launch(ev.sender_id, ev.reply)
 
 
