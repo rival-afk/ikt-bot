@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -305,14 +306,23 @@ FIO_RE = re.compile(r"^[А-ЯЁа-яё]+(?:-[А-ЯЁа-яё]+)?$")
 def load_users():
     try:
         STATE["users"] = json.loads(USERS_FILE.read_text(encoding="utf-8"))
-    except Exception:
+    except FileNotFoundError:
         STATE["users"] = {}
+    except Exception as e:
+        # битый файл — не затираем данные в памяти, чтобы не потерять эмодзи
+        log.warning("users.json не прочитался (%s) — держу старые данные", e)
+        STATE["users"] = STATE.get("users") or {}
 
 
 def save_users():
+    """Атомарно: .tmp -> rename, прежний файл остаётся как .bak."""
     try:
-        USERS_FILE.write_text(json.dumps(STATE["users"], ensure_ascii=False, indent=1),
-                              encoding="utf-8")
+        if USERS_FILE.exists():
+            shutil.copy2(USERS_FILE, USERS_FILE.with_suffix(".bak"))
+        tmp = USERS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(STATE["users"], ensure_ascii=False, indent=1),
+                       encoding="utf-8")
+        tmp.replace(USERS_FILE)
     except Exception:
         pass
 
