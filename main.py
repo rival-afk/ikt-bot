@@ -1258,9 +1258,6 @@ async def cmd_next(ev):
 @bot.on(events.NewMessage(pattern=r"^/ping(@\w+)?(\s|$)"))
 async def cmd_ping(ev):
     """/ping <юз> <n> — бот отправит n сообщений, каждое только из юза."""
-    if ev.sender_id != OWNER:
-        await ev.reply("/ping доступен только владельцу.")
-        return
     m = re.match(r"^/ping(?:@\w+)?\s+@?([A-Za-z0-9_]{3,32})\s+(\d{1,3})(\s|$)",
                  ev.raw_text or "")
     if not m:
