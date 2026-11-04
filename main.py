@@ -734,19 +734,6 @@ async def catchup():
 
 # ───────────────────────── ПЛАНЧИК ─────────────────────────
 
-@ub.on(events.NewMessage(chats=GROUPS))
-async def on_plan(ev):
-    t = ev.raw_text or ""
-    if not re.search(r"планчик\s+на\s+\d{1,2}\.\d{1,2}", t, re.I):
-        return
-    p = planmod.parse_plan(t, ev.message.date.astimezone(), CFG)
-    old = STATE["plan"]
-    if len(p["events"]) < 5 or (old and p["date"] < old["date"]):
-        return
-    accept_plan(p)
-    log.info("планчик на %s: %d событий", p["date"].strftime("%d.%m"), len(p["events"]))
-
-
 async def load_plan():
     msgs = []
     for gid in GROUPS:
@@ -775,6 +762,7 @@ async def load_plan():
             continue                      # битый «похожий на планчик» пост не убивает бот
         if not p["events"]:
             continue                      # «Планчик на 31.10» в ответе бота — не планчик
+        p["_src"] = m.id
         accept_plan(p)
         log.info("загружен планчик на %s: %d событий", p["date"].strftime("%d.%m"), len(p["events"]))
         return
@@ -908,33 +896,77 @@ async def poll_channel():
         await asyncio.sleep(90)
 
 
+async def poll_group():
+    """Страховка приёма планчика: жив-ивенты группы иногда провисают —
+    раз в 2 мин опрашиваем группы руками (свежие 30 мин, дедуп по id поста)."""
+    while True:
+        try:
+            now_utc = dt.datetime.now(dt.timezone.utc)
+            for gid in GROUPS:
+                msgs = await ub.get_messages(gid, limit=8)
+                for m in reversed(msgs or []):
+                    if not m or not m.message or getattr(m.sender, "bot", False):
+                        continue
+                    age = (now_utc - m.date).total_seconds()
+                    if 0 <= age < 1800:
+                        maybe_accept_plan(m.message, m.date.astimezone(),
+                                          False, mid=m.id)
+        except Exception:
+            log.exception("ошибка опроса группы")
+        await asyncio.sleep(120)
+
+
+def maybe_accept_plan(txt, posted_at, sender_is_bot=False, mid=0):
+    """Похоже ли сообщение на планчик; да — принимаем, если дата новее. → bool."""
+    if not txt or txt.startswith("Ноябрики ·") or sender_is_bot:
+        return False
+    lines = txt.splitlines()
+    first = lines[0].strip() if lines else ""
+    timed = sum(1 for ln in lines
+                if planmod.LINE_RE.match(ln) or planmod.RANGE_RE.match(ln))
+    if not (planmod.DATE_RE.search(txt) or planmod.DATE_HEAD_RE.match(first)) or timed < 5:
+        return False
+    try:
+        p = planmod.parse_plan(txt, posted_at, CFG)
+    except Exception:
+        return False
+    if len(p["events"]) < 5:
+        return False
+    old = STATE["plan"]
+    if old and p["date"] < old["date"]:
+        return False
+    # тот же пост уже принят (поллер ходит раз в 2 мин) — не переезжаем
+    if old and p["date"] == old["date"] and mid and mid == old.get("_src"):
+        return False
+    p["_src"] = mid
+    accept_plan(p)
+    log.info("планчик на %s принят: %d событий", p["date"].strftime("%d.%m"), len(p["events"]))
+    return True
+
+
 # ───────────────────────── команды бота ─────────────────────────
 
 @bot.on(events.NewMessage(chats=GROUP))
 async def plan_watch(ev):
-    """Новый планчик emitter в ИиКТ — сразу загружаем (не дожидаясь рестарта)."""
-    txt = ev.raw_text or ""
-    if not txt or txt.startswith("Ноябрики ·"):
+    """Новый планчик в ИиКТ live — сразу загружаем."""
+    maybe_accept_plan(ev.raw_text or "",
+                      ev.message.date.astimezone(),
+                      bool(getattr(ev.sender, "bot", False)),
+                      mid=ev.message.id)
+
+
+@ub.on(events.NewMessage(chats=GROUPS))
+async def on_plan(ev):
+    t = ev.raw_text or ""
+    if not re.search(r"планчик\s+на\s+\d{1,2}\.\d{1,2}", t, re.I):
         return
-    if getattr(ev.sender, "bot", False):
-        return
-    first = txt.splitlines()[0].strip() if txt else ""
-    timed = sum(1 for ln in txt.splitlines()
-                if planmod.LINE_RE.match(ln) or planmod.RANGE_RE.match(ln))
-    if not (planmod.DATE_RE.search(txt) or planmod.DATE_HEAD_RE.match(first)) or timed < 5:
-        return
-    try:
-        p = planmod.parse_plan(txt, ev.message.date.astimezone(), CFG)
-    except Exception:
-        return
-    if len(p["events"]) < 5:
-        return
+    p = planmod.parse_plan(t, ev.message.date.astimezone(), CFG)
     old = STATE["plan"]
-    if old and p["date"] < old["date"]:
-        return                      # старый планчик — не трогаем
+    if len(p["events"]) < 5 or (old and p["date"] < old["date"]):
+        return
+    p["_src"] = ev.message.id
     accept_plan(p)
-    log.info("планчик на %s принят из чата: %d событий",
-             p["date"].strftime("%d.%m"), len(p["events"]))
+    log.info("планчик на %s (юзербот): %d событий", p["date"].strftime("%d.%m"), len(p["events"]))
 
 
 @bot.on(events.NewMessage(pattern=r"^/start(@\w+)?(\s|$)"))
@@ -1218,8 +1250,8 @@ async def cmd_next(ev):
         await ev.reply("На сегодня напоминаний больше нет.")
         return
     e = upcoming[0]
-    await ev.reply("Следующее: %s\nНапомню в %s" % (
-        e["label"], (base_time(e) - dt.timedelta(minutes=offset_for(e))).strftime("%H:%M")))
+    await ev.reply("Следующее: %s (в %s)" % (
+        e["label"], base_time(e).strftime("%H:%M")))
 
 
 # ───────────────────────── main ─────────────────────────
@@ -1265,6 +1297,7 @@ async def _run():
     log.info("работаю: канал=%s, группа=%s, владелец=%s", CHANNEL, GROUP, OWNER)
     asyncio.create_task(scheduler())
     asyncio.create_task(poll_channel())
+    asyncio.create_task(poll_group())
     asyncio.create_task(sir_loop())
     await asyncio.gather(bot.run_until_disconnected(), ub.run_until_disconnected())
 
