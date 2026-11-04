@@ -1257,16 +1257,14 @@ async def cmd_next(ev):
 
 @bot.on(events.NewMessage(pattern=r"^/ping(@\w+)?(\s|$)"))
 async def cmd_ping(ev):
-    """/ping <юз> <n> — бот отправит n сообщений, каждое только из юза."""
+    """/ping <юз> <n> — бот отправит n сообщений, каждое только из юза.
+    На сам /ping не отвечает — просто пишет."""
     m = re.match(r"^/ping(?:@\w+)?\s+@?([A-Za-z0-9_]{3,32})\s+(\d{1,3})(\s|$)",
                  ev.raw_text or "")
     if not m:
-        await ev.reply("Использование: /ping <юз> <n> — например, /ping @rival 5\n"
-                       "Отправлю n сообщений, в каждом только юз. Максимум 20.")
-        return
+        return                       # битая команда — молчим
     username, n = m.group(1), min(int(m.group(2)), 20)
     if n < 1:
-        await ev.reply("n должно быть не меньше 1.")
         return
     sent = 0
     try:
@@ -1274,7 +1272,7 @@ async def cmd_ping(ev):
             await ev.reply("@" + username)
             sent += 1
     except Exception as e:
-        await ev.reply("Отправил %d из %d, дальше не вышло: %s" % (sent, n, type(e).__name__))
+        log.warning("ping: %d из %d отправлено, дальше не вышло: %s", sent, n, e)
         return
     log.info("ping: %d сообщений @%s от %s в %s", sent, username, ev.sender_id, ev.chat_id)
 
