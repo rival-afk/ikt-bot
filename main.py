@@ -43,9 +43,13 @@ EXTRA_GROUPS = [int(x) for x in CFG.get("extra_groups", [])]
 GROUPS = [GROUP] + EXTRA_GROUPS
 TARGETS = [OWNER] + GROUPS
 
-bot = TelegramClient(str(ROOT / "sessions" / "bot"), API_ID, API_HASH)
+# связь часто пропадает (мобильный интернет/Termux): телетон должен переподключаться
+# бесконечно, а не сдаться после 5 попыток и похоронить бота
+CONNECT = dict(connection_retries=None, retry_delay=5, request_retries=8)
+bot = TelegramClient(str(ROOT / "sessions" / "bot"), API_ID, API_HASH, **CONNECT)
 ub = TelegramClient(str(ROOT / "sessions" / "ikt-bot"), API_ID, API_HASH,
-                    device_model="ikt-bot", system_version="Termux", app_version="1.0")
+                    device_model="ikt-bot", system_version="Termux", app_version="1.0",
+                    **CONNECT)
 
 STATE = {
     "plan": None,          # {"date": date, "events": [...]}
@@ -280,17 +284,23 @@ def route(text):
 
 
 async def send_pair(text):
-    """Напоминания/уведомления о событиях: чат с /dont-notify не получает их."""
+    """Напоминания/уведомления о событиях: чат с /dont-notify не получает их.
+    → False, если ушло не всё из-за сети (напоминание надо повторить позже)."""
     if DRY:
         log.info("[DRY] %s", text.replace("\n", " / ")[:160])
-        return
+        return True
+    net_fail = False
     for chat in TARGETS:
         if chat in STATE["muted"]:
             continue
         try:
             await bot.send_message(chat, text)
-        except Exception as e:
+        except (OSError, asyncio.TimeoutError) as e:   # сетевое — временно, повторим
+            log.warning("сеть: не отправил в %s: %s", chat, e)
+            net_fail = True
+        except Exception as e:                        # чата нет/бот выгнан — навсегда, не повторяем
             log.warning("не отправил в %s: %s", chat, e)
+    return not net_fail
 
 
 # ───────────────────────── СИР и МЭС ─────────────────────────
@@ -862,17 +872,21 @@ async def scheduler():
                         if now < rem or now > base:
                             continue
                         log.info("напоминание (%d мин): %s", off, e["label"])
-                        await send_pair(render(e, off=off))
-                        STATE["sent"].add(okey)
-                        save_sent()
+                        if await send_pair(render(e, off=off)):
+                            STATE["sent"].add(okey)
+                            save_sent()
+                        else:
+                            log.warning("напоминание не ушло (сеть) — повторю позже")
                     # старт события — сразу после наступления
                     skey = "%s|%s|start" % (base.isoformat(), e["label"])
                     if (skey not in STATE["sent"]
                             and 0 <= (now - base).total_seconds() < 300):
                         log.info("старт: %s", e["label"])
-                        await send_pair(render(e, start=True))
-                        STATE["sent"].add(skey)
-                        save_sent()
+                        if await send_pair(render(e, start=True)):
+                            STATE["sent"].add(skey)
+                            save_sent()
+                        else:
+                            log.warning("старт не ушёл (сеть) — повторю позже")
             await scan_gather(now)
         except Exception:
             log.exception("ошибка планировщика")
@@ -914,6 +928,19 @@ async def poll_group():
         except Exception:
             log.exception("ошибка опроса группы")
         await asyncio.sleep(120)
+
+
+async def plan_watchdog():
+    """Если планчик не прогрузился (сеть лежала при старте) — пробуем раз в 5 минут."""
+    while True:
+        await asyncio.sleep(300)
+        p = STATE["plan"]
+        if p and p["date"] >= dt.date.today():
+            continue
+        try:
+            await load_plan()
+        except Exception:
+            log.exception("планчик: повторная загрузка не удалась")
 
 
 def maybe_accept_plan(txt, posted_at, sender_is_bot=False, mid=0):
@@ -1321,6 +1348,7 @@ async def _run():
     asyncio.create_task(scheduler())
     asyncio.create_task(poll_channel())
     asyncio.create_task(poll_group())
+    asyncio.create_task(plan_watchdog())
     asyncio.create_task(sir_loop())
     await asyncio.gather(bot.run_until_disconnected(), ub.run_until_disconnected())
 
