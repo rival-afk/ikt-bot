@@ -61,6 +61,8 @@ SENT_FILE = ROOT / "sessions" / ".sent.json"
 SEEN_FILE = ROOT / "sessions" / ".seen.json"
 RECENT_FILE = ROOT / "sessions" / ".recent.json"
 MUTED_FILE = ROOT / "sessions" / ".muted.json"
+PLAN_FILE = ROOT / "sessions" / ".plan.json"
+PLAN_PREV_FILE = ROOT / "sessions" / ".prev_plan.json"
 LOCK_FILE = ROOT / ".run" / "bot.lock"
 
 
@@ -763,7 +765,11 @@ async def load_plan():
                 continue
             msgs.append(m)
     if not msgs:
-        log.warning("планчик не найден в чатах")
+        if STATE.get("plan"):
+            log.info("планчик в чатах не найден — держу сохранённый на %s",
+                     STATE["plan"]["date"].strftime("%d.%m"))
+        else:
+            log.warning("планчик не найден в чатах")
         return
     for m in sorted(msgs, key=lambda x: x.date, reverse=True):
         try:
@@ -781,12 +787,74 @@ async def load_plan():
 
 # ───────────────────────── напоминания ─────────────────────────
 
+def _ev_to_dict(e):
+    d = dict(e)
+    d["when"] = e["when"].isoformat()
+    if e.get("gather"):
+        d["gather"] = {"time": e["gather"]["time"].isoformat(), "text": e["gather"]["text"]}
+    return d
+
+
+def _ev_from_dict(d):
+    e = dict(d)
+    e["when"] = dt.datetime.fromisoformat(d["when"])
+    if d.get("gather"):
+        g = dict(d["gather"]); g["time"] = dt.datetime.fromisoformat(g["time"]); e["gather"] = g
+    return e
+
+
+def plan_to_dict(p):
+    return {"date": p["date"].isoformat(), "_src": p.get("_src"),
+            "events": [_ev_to_dict(e) for e in p["events"]]}
+
+
+def plan_from_dict(d):
+    try:
+        return {"date": dt.date.fromisoformat(d["date"]),
+                "_src": d.get("_src"),
+                "events": [_ev_from_dict(e) for e in d["events"]]}
+    except Exception:
+        return None
+
+
+def save_plan():
+    """Планчик живёт в файле — рестарт бота больше не стирает его."""
+    try:
+        if STATE.get("plan"):
+            PLAN_FILE.write_text(json.dumps(plan_to_dict(STATE["plan"]), ensure_ascii=False),
+                                 encoding="utf-8")
+        if STATE.get("prev_plan"):
+            PLAN_PREV_FILE.write_text(json.dumps(plan_to_dict(STATE["prev_plan"]),
+                                                  ensure_ascii=False),
+                                      encoding="utf-8")
+    except Exception:
+        pass
+
+
+def load_saved_plan():
+    """Поднять планчик из файла (чат может не содержать оригинала — он удалён)."""
+    for key, f in (("plan", PLAN_FILE), ("prev_plan", PLAN_PREV_FILE)):
+        try:
+            p = plan_from_dict(json.loads(f.read_text(encoding="utf-8")))
+            if p:
+                STATE[key] = p
+        except FileNotFoundError:
+            pass
+        except Exception:
+            log.exception("не прочитал %s", f.name)
+    p = STATE.get("plan")
+    if p:
+        log.info("планчик на %s восстановлен из файла (%d событий)",
+                 p["date"].strftime("%d.%m"), len(p["events"]))
+
+
 def accept_plan(p):
     """План заменяет текущий, прежний остаётся в памяти (prev_plan)."""
     old = STATE.get("plan")
     if old is not None and old is not p:
         STATE["prev_plan"] = old
     STATE["plan"] = p
+    save_plan()
 
 
 def offset_for(ev):
@@ -1332,6 +1400,7 @@ async def _run():
         return
 
     load_route_model()
+    load_saved_plan()          # план переживает рестарт даже без оригинала в чате
     await load_plan()
     await catchup()
 
