@@ -26,7 +26,11 @@ def classify(label, cfg):
 
 
 def parse_plan(text, posted_at, cfg):
-    """→ dict(date=date, events=[{when, label, kind, section}])"""
+    """→ dict(date=date|None, events=[{when, label, kind, section}])
+
+    Дата берётся только явно: «Планчик на DD.MM» или заголовок «🌸DD.MM🌸»
+    в первых строках. Без явной даты → date=None: чужие копипасты-расписания
+    (например «ПЛАН НА ДЕНЬ 07.11.2026») планчиком не считаются."""
     common = cfg.get("common_events", [])
     day = month = None
     m = DATE_RE.search(text or "")
@@ -46,9 +50,11 @@ def parse_plan(text, posted_at, cfg):
         if (date - posted_at.date()).days < -180:
             date = dt.date(year + 1, month, day)
     else:
-        date = posted_at.date() + dt.timedelta(days=1)
+        date = None
 
     events, section = [], None
+    if date is None:
+        return {"date": None, "events": events}
     for raw in (text or "").splitlines():
         line = raw.strip()
         low = re.sub(r"\s+", " ", line.lower()).strip()

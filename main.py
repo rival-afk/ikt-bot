@@ -54,6 +54,7 @@ ub = TelegramClient(str(ROOT / "sessions" / "ikt-bot"), API_ID, API_HASH,
 STATE = {
     "plan": None,          # {"date": date, "events": [...]}
     "prev_plan": None,     # прошлый планчик — держим в памяти
+    "plans": {},           # архив: все планчики, которые бот видел (date -> план)
     "seen": set(),         # id сообщений Ноябриков
     "sent": set(),         # ключи отправленных напоминаний
 }
@@ -63,6 +64,7 @@ RECENT_FILE = ROOT / "sessions" / ".recent.json"
 MUTED_FILE = ROOT / "sessions" / ".muted.json"
 PLAN_FILE = ROOT / "sessions" / ".plan.json"
 PLAN_PREV_FILE = ROOT / "sessions" / ".prev_plan.json"
+PLANS_FILE = ROOT / "sessions" / ".plans.json"   # архив всех планчиков
 LOCK_FILE = ROOT / ".run" / "bot.lock"
 
 
@@ -778,11 +780,20 @@ async def load_plan():
             continue                      # битый «похожий на планчик» пост не убивает бот
         if not p["events"]:
             continue                      # «Планчик на 31.10» в ответе бота — не планчик
+        if p["date"] is None:             # чужие копипасты-расписания без нашей даты
+            continue
         p["_src"] = m.id
-        accept_plan(p)
-        log.info("загружен планчик на %s: %d событий", p["date"].strftime("%d.%m"), len(p["events"]))
-        return
-    log.warning("планчик с событиями не найден в чатах")
+        if plan_ok_for_today(p):
+            archive_plan(p)
+            accept_plan(p)
+            log.info("загружен планчик на %s: %d событий", p["date"].strftime("%d.%m"), len(p["events"]))
+            return
+        archive_plan(p)                   # старый — только в архив, активным не делаем
+    if STATE.get("plan"):
+        log.info("активного планчика в чатах не нашлось — держу сохранённый на %s",
+                 STATE["plan"]["date"].strftime("%d.%m"))
+    else:
+        log.warning("актуального планчика в чатах не нашлось")
 
 
 # ───────────────────────── напоминания ─────────────────────────
@@ -846,6 +857,47 @@ def load_saved_plan():
     if p:
         log.info("планчик на %s восстановлен из файла (%d событий)",
                  p["date"].strftime("%d.%m"), len(p["events"]))
+
+
+def save_archive():
+    try:
+        data = {k: plan_to_dict(v) for k, v in STATE["plans"].items()}
+        PLANS_FILE.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def load_archive():
+    try:
+        raw = json.loads(PLANS_FILE.read_text(encoding="utf-8"))
+        STATE["plans"] = {k: p for k, p in
+                          ((k, plan_from_dict(v)) for k, v in raw.items()) if p}
+    except FileNotFoundError:
+        pass
+    except Exception:
+        log.exception("не прочитал архив планчиков")
+
+
+def archive_plan(p):
+    """Каждый планчик, который бот принимал/видел, попадает в архив."""
+    if not p or not p.get("date"):
+        return
+    STATE["plans"][p["date"].isoformat()] = p
+    save_archive()
+
+
+def plan_ok_for_today(p):
+    """Сверка с датой: планчик должен быть сегодняшним или ближайшим будущим."""
+    today = dt.date.today()
+    if p["date"] < today:
+        log.info("планчик на %s уже в прошлом — активным не ставлю",
+                 p["date"].strftime("%d.%m"))
+        return False
+    if (p["date"] - today).days > 10:
+        log.info("планчик на %s слишком далеко впереди — активным не ставлю",
+                 p["date"].strftime("%d.%m"))
+        return False
+    return True
 
 
 def accept_plan(p):
@@ -1028,12 +1080,15 @@ def maybe_accept_plan(txt, posted_at, sender_is_bot=False, mid=0):
     if len(p["events"]) < 5:
         return False
     old = STATE["plan"]
-    if old and p["date"] < old["date"]:
+    if p["date"] is None or not plan_ok_for_today(p):
+        archive_plan(p)
         return False
     # тот же пост уже принят (поллер ходит раз в 2 мин) — не переезжаем
     if old and p["date"] == old["date"] and mid and mid == old.get("_src"):
+        archive_plan(p)
         return False
     p["_src"] = mid
+    archive_plan(p)
     accept_plan(p)
     log.info("планчик на %s принят: %d событий", p["date"].strftime("%d.%m"), len(p["events"]))
     return True
@@ -1056,10 +1111,11 @@ async def on_plan(ev):
     if not re.search(r"планчик\s+на\s+\d{1,2}\.\d{1,2}", t, re.I):
         return
     p = planmod.parse_plan(t, ev.message.date.astimezone(), CFG)
-    old = STATE["plan"]
-    if len(p["events"]) < 5 or (old and p["date"] < old["date"]):
+    if p["date"] is None or not p.get("events") or not plan_ok_for_today(p):
+        archive_plan(p)
         return
     p["_src"] = ev.message.id
+    archive_plan(p)
     accept_plan(p)
     log.info("планчик на %s (юзербот): %d событий", p["date"].strftime("%d.%m"), len(p["events"]))
 
@@ -1247,15 +1303,7 @@ async def cmd_unwash(ev):
     await ev.reply("Разбанен: %s" % who)
 
 
-@bot.on(events.NewMessage(pattern=r"^/plan(@\w+)?(\s|$)"))
-async def cmd_plan(ev):
-    p = STATE["plan"]
-    if not p or not p.get("events"):
-        await load_plan()
-        p = STATE["plan"]
-    if not p or not p.get("events"):
-        await ev.reply("Планчик не найден в ИиКТ.")
-        return
+def render_plan_text(p):
     lines = ["Планчик на %s" % p["date"].strftime("%d.%m")]
     last_sec = "INIT"
     for e in p["events"]:
@@ -1271,7 +1319,43 @@ async def cmd_plan(ev):
         lines.append("%s — %s%s" % (e["when"].strftime("%H:%M"), e["label"], add))
     while lines and not lines[0]:
         lines.pop(0)
-    await ev.reply("\n".join(lines))
+    return "\n".join(lines)
+
+
+@bot.on(events.NewMessage(pattern=r"^/plan(@\w+)?(?:\s+(\d{1,2}\.\d{1,2}))?(\s|$)"))
+async def cmd_plan(ev):
+    arg = ev.pattern_match.group(2)
+    if arg:
+        dd, mm = (int(x) for x in arg.split("."))
+        if not (1 <= mm <= 12 and 1 <= dd <= 31):
+            await ev.reply("Неверная дата: %s (жду ДД.ММ, например /plan 07.11)" % arg)
+            return
+        today = dt.date.today()
+        date = dt.date(today.year, mm, dd)
+        if (date - today).days < -180:            # «01.01» после декабря — следующий год
+            date = dt.date(today.year + 1, mm, dd)
+        p = STATE["plan"] if (STATE["plan"] and STATE["plan"]["date"] == date) \
+            else STATE["plans"].get(date.isoformat())
+        if not p:
+            known = [d for d in sorted(STATE["plans"])][-5:]
+            if known:
+                await ev.reply("Планчик на %s не найден.\nВ архиве есть: %s" % (
+                    date.strftime("%d.%m"),
+                    ", ".join("%s.%s" % (d[8:10], d[5:7]) for d in known)))
+            else:
+                await ev.reply("Планчик на %s не найден, архив планчиков пуст." %
+                               date.strftime("%d.%m"))
+            return
+        await ev.reply(render_plan_text(p))
+        return
+    p = STATE["plan"]
+    if not p or not p.get("events"):
+        await load_plan()
+        p = STATE["plan"]
+    if not p or not p.get("events"):
+        await ev.reply("Планчик не найден в ИиКТ.")
+        return
+    await ev.reply(render_plan_text(p))
 
 
 @bot.on(events.NewMessage(pattern=r"^/all(@\w+)?(\s|$)"))
@@ -1401,6 +1485,7 @@ async def _run():
 
     load_route_model()
     load_saved_plan()          # план переживает рестарт даже без оригинала в чате
+    load_archive()             # все планчики, что бот видел, — для /plan <дата>
     await load_plan()
     await catchup()
 
