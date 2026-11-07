@@ -26,6 +26,18 @@ def classify(label, cfg):
     return "five"          # любое другое событие — за 5 минут
 
 
+def has_explicit_date(text):
+    """Есть ли явная дата планчика: «Планчик на ДД.ММ», «ДД.ММ» или «ДД.ММ.ГГГГ»
+    в первых строках."""
+    if DATE_RE.search(text or ""):
+        return True
+    for raw in (text or "").splitlines()[:4]:
+        r = (raw or "").strip()
+        if DATE_HEAD_RE.match(r) or DATE_FULL_RE.search(r):
+            return True
+    return False
+
+
 def parse_plan(text, posted_at, cfg):
     """→ dict(date=date|None, events=[{when, label, kind, section}])
 

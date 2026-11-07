@@ -762,8 +762,9 @@ async def load_plan():
             if getattr(m.sender, "bot", False):
                 continue                      # ответы самого бота (/plan) — не планчик
             txt = m.message or ""
-            if not (planmod.DATE_RE.search(txt) or planmod.DATE_HEAD_RE.match(txt.splitlines()[0].strip() if txt else "")
-                    or sum(1 for ln in txt.splitlines() if planmod.LINE_RE.match(ln) or planmod.RANGE_RE.match(ln)) >= 5):
+            if not (planmod.has_explicit_date(txt)
+                    or sum(1 for ln in txt.splitlines()
+                           if planmod.LINE_RE.match(ln) or planmod.RANGE_RE.match(ln)) >= 5):
                 continue
             msgs.append(m)
     if not msgs:
@@ -1071,7 +1072,7 @@ def maybe_accept_plan(txt, posted_at, sender_is_bot=False, mid=0):
     first = lines[0].strip() if lines else ""
     timed = sum(1 for ln in lines
                 if planmod.LINE_RE.match(ln) or planmod.RANGE_RE.match(ln))
-    if not (planmod.DATE_RE.search(txt) or planmod.DATE_HEAD_RE.match(first)) or timed < 5:
+    if not planmod.has_explicit_date(txt) or timed < 5:
         return False
     try:
         p = planmod.parse_plan(txt, posted_at, CFG)
