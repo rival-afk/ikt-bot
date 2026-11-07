@@ -5,6 +5,7 @@ import unicodedata
 
 DATE_RE = re.compile(r"ПЛАНЧИК\s+на\s+(\d{1,2})\.(\d{1,2})", re.I)
 DATE_HEAD_RE = re.compile(r"^\D*?(\d{1,2})\.(\d{1,2})\D*$")   # «🌸02.11🌸» в первой строке
+DATE_FULL_RE = re.compile(r"\b(\d{1,2})\.(\d{1,2})\.(\d{4})\b")  # «07.11.2026» в первых строках
 LINE_RE = re.compile(r"^\s*(\d{1,2})[:.](\d{2})\s*[-\u2013\u2014]\s*(.+?)\s*$")
 RANGE_RE = re.compile(r"^\s*(\d{1,2})[:.](\d{2})\s*[-\u2013\u2014]\s*(\d{1,2})[:.](\d{2})\s*[-\u2013\u2014]\s*(.+?)\s*$")
 SECTIONS_PLAIN = {"икт": "ИКТ", "инф": "Инф", "информатики": "Инф"}
@@ -33,22 +34,27 @@ def parse_plan(text, posted_at, cfg):
     (например «ПЛАН НА ДЕНЬ 07.11.2026») планчиком не считаются."""
     common = cfg.get("common_events", [])
     day = month = None
+    year = None
     m = DATE_RE.search(text or "")
     if m:
         day, month = int(m.group(1)), int(m.group(2))
     else:
-        # «🌸02.11🌸» заголовком, без слова ПЛАНЧИК
-        for raw in (text or "").splitlines()[:3]:
+        # «🌸02.11🌸» или «07.11.2026» в первых строках
+        for raw in (text or "").splitlines()[:4]:
             hm = DATE_HEAD_RE.match(raw.strip())
             if hm:
                 day, month = int(hm.group(1)), int(hm.group(2))
                 break
+            fm = DATE_FULL_RE.search(raw)
+            if fm and 1 <= int(fm.group(2)) <= 12 and 1 <= int(fm.group(1)) <= 31:
+                day, month, year = int(fm.group(1)), int(fm.group(2)), int(fm.group(3))
+                break
     if day and month and 1 <= month <= 12 and 1 <= day <= 31:
-        year = posted_at.year
-        date = dt.date(year, month, day)
+        y = year or posted_at.year
+        date = dt.date(y, month, day)
         # планчик на 31.12, опубликован 30.12 — ок; на 01.01 — следующий год
-        if (date - posted_at.date()).days < -180:
-            date = dt.date(year + 1, month, day)
+        if year is None and (date - posted_at.date()).days < -180:
+            date = dt.date(y + 1, month, day)
     else:
         date = None
 
