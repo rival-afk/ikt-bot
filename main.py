@@ -41,7 +41,7 @@ CHANNEL = int(CFG["channel_id"])
 GROUP = int(CFG["group_id"])
 EXTRA_GROUPS = [int(x) for x in CFG.get("extra_groups", [])]
 GROUPS = [GROUP] + EXTRA_GROUPS
-TARGETS = [OWNER] + GROUPS
+TARGETS = [GROUP]                     # пишем только в ИиКТ (задание владельца)
 
 # связь часто пропадает (мобильный интернет/Termux): телетон должен переподключаться
 # бесконечно, а не сдаться после 5 попыток и похоронить бота
@@ -423,12 +423,6 @@ async def sir_round():
         await bot.send_message(GROUP, text, parse_mode="html",
                                buttons=[[Button.url("Пройти сир и мэс",
                                                     BOT_LINK + "?start=sir")]])
-        for u in missed:
-            try:
-                await bot.send_message(u["id"],
-                                       "Не забудь заполнить сир и мэс. Заполнить: /sir")
-            except Exception:
-                pass
 
 
 async def sir_rollover():
@@ -602,7 +596,9 @@ async def sir_pm(ev):
         await sir_launch(ev.sender_id, ev.reply)
         return
 
-    # без сессии: любое сообщение в ЛС с незаполненным СИР/МЭС — приглашение заполнить
+    # без сессии: приглашение заполнить — только если СИР/МЭС включён
+    if not CFG.get("sir_enabled", True):
+        return
     filled = STATE.get("sir", {}).get("filled", {})
     if str(ev.sender_id) not in filled and ev.sender_id in (await sir_people()):
         await sir_launch(ev.sender_id, ev.reply)
@@ -678,15 +674,11 @@ async def process_channel_message(m):
         log.info("[DRY] переслал бы: %s", caption.replace("\n", " / ")[:160])
         return
 
-    targets = [OWNER]
-    if r["group"]:
-        targets.append(GROUP)
-    if r["extra"]:
-        targets += EXTRA_GROUPS
-    if not (r["group"] or r["extra"]):
+    targets = [GROUP] if r["group"] else []   # только ИиКТ
+    if not targets:
         STATE["seen"].add(m.id)
         save_seen()
-        return   # ни одному чату не нужно — и себе не шлём
+        return   # ни одному чату не нужно
 
     # медиа скачиваем в файл с правильным расширением (raw m.media бот шлём не умеет)
     media_path = None
