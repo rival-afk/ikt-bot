@@ -512,6 +512,7 @@ async def sir_launch(uid, send):
 
 @bot.on(events.NewMessage(pattern=r"^/sir(@\w+)?(\s|$)"))
 async def cmd_sir(ev):
+    if spam_blocked(ev, "sir"): return
     """Заполнение СИР и МЭС — только в ЛС."""
     if not ev.is_private:
         try:
@@ -529,6 +530,7 @@ async def cmd_sir(ev):
 
 @bot.on(events.NewMessage(pattern=r"^/nosir(@\w+)?(\s|$)"))
 async def cmd_nosir(ev):
+    if spam_blocked(ev, "nosir"): return
     """Отключить сир и мэс для себя — остаётся только выбор эмодзи."""
     if not ev.is_private:
         try:
@@ -545,6 +547,7 @@ async def cmd_nosir(ev):
 
 @bot.on(events.NewMessage(pattern=r"^/emoji(@\w+)?(\s|$)"))
 async def cmd_emoji(ev):
+    if spam_blocked(ev, "emoji"): return
     """Выбор/перевыбор личного эмодзи — только в ЛС."""
     if not ev.is_private:
         try:
@@ -1087,6 +1090,35 @@ def maybe_accept_plan(txt, posted_at, sender_is_bot=False, mid=0):
     return True
 
 
+SPAM = {}   # (uid, bucket) -> unix-отметки вызовов
+
+
+def spam_blocked(ev, bucket, limit=3, window=60):
+    """Спамблок для команд в группах: не более limit вызовов от одного человека
+    за window секунд. Плюс общий потолок 15 команд в минуту на человека."""
+    if not ev.is_group and not ev.is_channel:
+        return False                     # в ЛС не ограничиваем
+    uid = ev.sender_id or 0
+    now = dt.datetime.now().timestamp()
+    g = [t for t in SPAM.get((uid, "*"), []) if now - t < 60]
+    if len(g) >= 15:
+        SPAM[(uid, "*")] = g
+        log.info("спам: %s заблокирован (%s, общий потолок)", uid, bucket)
+        return True
+    lst = [t for t in SPAM.get((uid, bucket), []) if now - t < window]
+    if len(lst) >= limit:
+        SPAM[(uid, bucket)] = lst
+        g.append(now)
+        SPAM[(uid, "*")] = g
+        log.info("спам: %s заблокирован (%s, %d/%d за %dс)", uid, bucket, len(lst), limit, window)
+        return True
+    lst.append(now)
+    g.append(now)
+    SPAM[(uid, bucket)] = lst
+    SPAM[(uid, "*")] = g
+    return False
+
+
 # ───────────────────────── команды бота ─────────────────────────
 
 @bot.on(events.NewMessage(chats=GROUP))
@@ -1135,6 +1167,7 @@ async def cmd_start(ev):
 
 @bot.on(events.NewMessage(pattern=r"^/(notify|dontnotify|dont-notify|dont_notify)(@\w+)?(\s|$)"))
 async def cmd_ctrl_notify(ev):
+    if spam_blocked(ev, "notify"): return
     """Уведомления о событиях: /dont-notify выключить в чате, /notify включить."""
     if not ev.is_private and not await _admin_only(ev):
         await ev.reply("Команда только для админов.")
@@ -1154,6 +1187,7 @@ async def cmd_ctrl_notify(ev):
 
 @bot.on(events.NewMessage(pattern=r"^/(vonyat|вонять)(@\w+)?(\s|$)"))
 async def cmd_vonyat(ev):
+    if spam_blocked(ev, "vonyat"): return
     lines = ["ИКТ тут", ""]
 
     async def ping(client):
@@ -1210,6 +1244,7 @@ async def _wash_target(ev, body):
 
 @bot.on(events.NewMessage(pattern=r"(?i)^помыть(\s|$)"))
 async def cmd_wash(ev):
+    if spam_blocked(ev, "pomyt", 2, 60): return
     """помыть [7 д|3 ч|15 м] [@цель] + причина отдельной строкой. Цель — реплай или @юзер."""
     if not (ev.is_group or ev.is_channel):
         return
@@ -1271,6 +1306,7 @@ async def cmd_wash(ev):
 
 @bot.on(events.NewMessage(pattern=r"(?i)^разбан(\s|$)"))
 async def cmd_unwash(ev):
+    if spam_blocked(ev, "razban", 2, 60): return
     if not (ev.is_group or ev.is_channel):
         return
     if not await _admin_only(ev):
@@ -1317,6 +1353,7 @@ def render_plan_text(p):
 
 @bot.on(events.NewMessage(pattern=r"^/plan(@\w+)?(?:\s+(\d{1,2}\.\d{1,2}))?(\s|$)"))
 async def cmd_plan(ev):
+    if spam_blocked(ev, "plan"): return
     arg = ev.pattern_match.group(2)
     if arg:
         dd, mm = (int(x) for x in arg.split("."))
@@ -1353,6 +1390,7 @@ async def cmd_plan(ev):
 
 @bot.on(events.NewMessage(pattern=r"^/all(@\w+)?(\s|$)"))
 async def cmd_all(ev):
+    if spam_blocked(ev, "all"): return
     if not (ev.is_group or ev.is_channel):
         await ev.reply("Эта команда работает в группе.")
         return
@@ -1413,6 +1451,7 @@ async def cmd_all(ev):
 
 @bot.on(events.NewMessage(pattern=r"^/next(@\w+)?(\s|$)"))
 async def cmd_next(ev):
+    if spam_blocked(ev, "next"): return
     p = STATE["plan"]
     now = dt.datetime.now()
     if not p:
@@ -1429,6 +1468,7 @@ async def cmd_next(ev):
 
 @bot.on(events.NewMessage(pattern=r"^/ping(@\w+)?(\s|$)"))
 async def cmd_ping(ev):
+    if spam_blocked(ev, "ping", 1, 30): return
     """/ping <юз> <n> — бот отправит n сообщений, каждое только из юза.
     На сам /ping не отвечает — просто пишет."""
     m = re.match(r"^/ping(?:@\w+)?\s+@?([A-Za-z0-9_]{3,32})\s+(\d{1,3})(\s|$)",
