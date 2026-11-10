@@ -939,6 +939,12 @@ async def scan_gather(now):
     if not p:
         return
     window = dt.timedelta(hours=CFG.get("gather_window_hours", 3))
+    # выбросить прежние чужие сборы (например, вместо нашей смены — олимпиадников)
+    for e in p["events"]:
+        g = e.get("gather")
+        if g and "проектн" not in (g.get("text") or "").lower():
+            log.info("снял непригодный сбор для %r", e["label"])
+            e.pop("gather", None)
     pending = [e for e in p["events"]
                if e["kind"] == "school" and not e.get("gather")
                and now - dt.timedelta(minutes=30) < e["when"] < now + window]
@@ -953,7 +959,10 @@ async def scan_gather(now):
         day_start = dt.datetime.combine(e["when"].date(), dt.time(0, 0))
         for m in msgs:
             t = m.message or ""
-            if kw not in t.lower():
+            tlow = t.lower()
+            if "проектн" not in tlow:    # чужая смена (олимпиадники/учебная) — не берём
+                continue
+            if kw not in tlow:
                 continue
             if m.date and m.date.astimezone().replace(tzinfo=None) < day_start:
                 continue          # только сегодняшние посты, не вчерашние
