@@ -9,9 +9,16 @@ SUP_PID="$RUN/supervisor.pid"
 
 alive() { [[ -f "$1" ]] && kill -0 "$(cat "$1" 2>/dev/null)" 2>/dev/null; }
 
+any_supervisor() { ps -eo pid,comm,args | grep '[s]upervisor.sh' && return 0 || return 1; }
+
 start() {
   if alive "$SUP_PID"; then
     echo "уже работает (supervisor $(cat "$SUP_PID"))"
+    return
+  fi
+  # pid-файл мог потеряться — если supervisor жив, не запускаем второго
+  if any_supervisor >/dev/null; then
+    echo "супервизоры живут: $(any_supervisor | awk '{print $1}' | tr '\n' ' ')— второй не запускаю"
     return
   fi
   pkill -9 -f "[p]ython main.py" 2>/dev/null || true

@@ -135,5 +135,6 @@
     "23:00"
   ],
   "transfer_noyabrki": false,
-  "sir_enabled": false
+  "sir_enabled": false,
+  "ub_enabled": false
 }

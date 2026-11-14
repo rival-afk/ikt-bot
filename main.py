@@ -57,6 +57,8 @@ STATE = {
     "plans": {},           # архив: все планчики, которые бот видел (date -> план)
     "seen": set(),         # id сообщений Ноябриков
     "sent": set(),         # ключи отправленных напоминаний
+    "ub_enabled": CFG.get("ub_enabled", True),   # юзербот (читает канал) — по флагу
+    "dice": {},            # счётчик бросков кубиков по чатам
 }
 SENT_FILE = ROOT / "sessions" / ".sent.json"
 SEEN_FILE = ROOT / "sessions" / ".seen.json"
@@ -74,9 +76,16 @@ def acquire_lock():
     if LOCK_FILE.exists():
         try:
             pid = int(LOCK_FILE.read_text().strip())
-            os.kill(pid, 0)
-            log.error("бот уже запущен (pid %s) — второй инстанс не стартую", pid)
-            return False
+            # живой? (зомби — тоже мёртв: смотрим состояние в /proc)
+            st = ""
+            try:
+                st = open("/proc/%d/stat" % pid).read().rsplit(") ", 1)[1].split()[0]
+            except Exception:
+                st = "S"          # не можем прочитать — считаем живым
+            if st != "Z":
+                os.kill(pid, 0)
+                log.error("бот уже запущен (pid %s) — второй инстанс не стартую", pid)
+                return False
         except (ValueError, ProcessLookupError, TypeError):
             pass
     LOCK_FILE.write_text(str(os.getpid()))
@@ -377,10 +386,10 @@ async def sir_people():
     try:
         # у Telethon iter_participants отдаёт User напрямую; тимлиды — админы группы
         admin_ids = set()
-        async for u in ub.iter_participants(GROUP,
+        async for u in bot.iter_participants(GROUP,
                                             filter=types.ChannelParticipantsAdmins):
             admin_ids.add(u.id)
-        async for u in ub.iter_participants(GROUP):
+        async for u in bot.iter_participants(GROUP):
             if getattr(u, "bot", False) or getattr(u, "deleted", False):
                 continue
             if u.id in admin_ids:
@@ -723,6 +732,8 @@ async def on_channel(ev):
 
 async def catchup():
     """Догоняем посты, пришедшие пока бот был выключен/перезапускался."""
+    if not STATE["ub_enabled"]:
+        return
     try:
         msgs = await ub.get_messages(CHANNEL, limit=40)
     except Exception as e:
@@ -744,6 +755,13 @@ async def catchup():
 # ───────────────────────── ПЛАНЧИК ─────────────────────────
 
 async def load_plan():
+    if not STATE["ub_enabled"]:
+        if STATE.get("plan"):
+            log.warning("юзербот отключён — планчик читаем только из файла: %s",
+                        STATE["plan"]["date"].strftime("%d.%m"))
+        else:
+            log.warning("юзербот отключён, сохранённого планчика нет")
+        return
     msgs = []
     for gid in GROUPS:
         try:
@@ -945,6 +963,8 @@ async def scan_gather(now):
         if g and "проектн" not in (g.get("text") or "").lower():
             log.info("снял непригодный сбор для %r", e["label"])
             e.pop("gather", None)
+    if not STATE["ub_enabled"]:
+        return
     pending = [e for e in p["events"]
                if e["kind"] == "school" and not e.get("gather")
                and now - dt.timedelta(minutes=30) < e["when"] < now + window]
@@ -1021,6 +1041,8 @@ async def scheduler():
 async def poll_channel():
     """Страховка: lив-ивенты канала иногда не приходят часами —
     раз в 90 сек опрашиваем Ноябрики руками и прогоняем через обработчик."""
+    if not STATE["ub_enabled"]:
+        return
     while True:
         try:
             msgs = await ub.get_messages(CHANNEL, limit=8)
@@ -1038,6 +1060,8 @@ async def poll_channel():
 async def poll_group():
     """Страховка приёма планчика: жив-ивенты группы иногда провисают —
     раз в 2 мин опрашиваем группы руками (свежие 30 мин, дедуп по id поста)."""
+    if not STATE["ub_enabled"]:
+        return
     while True:
         try:
             now_utc = dt.datetime.now(dt.timezone.utc)
@@ -1128,7 +1152,117 @@ def spam_blocked(ev, bucket, limit=3, window=60):
     return False
 
 
-# ───────────────────────── команды бота ─────────────────────────
+DICE_FILE = ROOT / "sessions" / ".dice.json"
+DICE_NAMES = {"🎲": "кубик", "🎯": "дартс", "🎳": "боулинг", "🏀": "баскетбол",
+              "⚽": "футбол", "🎰": "слоты"}
+
+
+def load_dice():
+    try:
+        STATE["dice"] = json.loads(DICE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        STATE["dice"] = {}
+
+
+def save_dice():
+    try:
+        DICE_FILE.write_text(json.dumps(STATE["dice"], ensure_ascii=False),
+                             encoding="utf-8")
+    except Exception:
+        pass
+
+
+def dice_outcome(emoji, v):
+    """→ (текст результата, это_победа|None если нечего считать)."""
+    if emoji == "🎲":
+        return "%d" % v, None
+    if emoji == "🎯":
+        return ("яблочко!" if v == 6 else "мимо"), v == 6
+    if emoji == "🎳":
+        return ("страйк!" if v == 6 else "%d кегель" % (v - 1)), v == 6
+    if emoji == "🏀":
+        return ("трехочковое!" if v == 5 else "двухочковое!" if v == 4 else "промах"), v >= 4
+    if emoji == "⚽":
+        return ("гол!" if v >= 4 else "мимо"), v >= 4
+    if emoji == "🎰":
+        if v == 64:
+            return "ДЖЕКПОТ! (три семёрки)", True
+        sym = [1, 2, 3, 0]
+        left, center, right = sym[(v - 1) & 3], sym[((v - 1) >> 2) & 3], sym[((v - 1) >> 4) & 3]
+        if left == center == right:
+            return "три в ряд (символ %d)!" % left, True
+        return "мимо", False
+    return "🎲 %d" % v, None
+
+
+@bot.on(events.NewMessage(chats=GROUPS))
+async def dice_watch(ev):
+    d = getattr(ev.message, "dice", None)
+    if not d:
+        return
+    uid, chat = ev.sender_id, ev.chat_id
+    if not uid or not chat:
+        return
+    emoji, v = d.emoticon, d.value
+    outcome, win = dice_outcome(emoji, v)
+    you = STATE["users"].get(str(uid)) or {}
+    name = you.get("name") or getattr(ev.sender, "first_name", "") or str(uid)
+    user_rec = STATE["dice"].setdefault(str(chat), {}).setdefault(str(uid), {})
+    rec = user_rec.setdefault(emoji,
+                              {"rolls": 0, "wins": 0, "sum": 0, "best": 0})
+    rec["rolls"] += 1
+    rec["sum"] += v
+    rec["best"] = max(rec["best"], v)
+    if win:
+        rec["wins"] += 1
+    rec["name"] = name
+    if getattr(ev.sender, "username", None):
+        rec["user"] = ev.sender.username
+    save_dice()
+    log.info("кубик в %s: %s -> %s р (%s)", chat, name, emoji, outcome)
+
+
+def render_dice(chat_id):
+    rows = STATE["dice"].get(str(chat_id)) or {}
+    if not rows:
+        return "Пока бросков нет — киньте любой кубик."
+    table = []
+    total_rolls = 0
+    total_wins = 0
+    for uid, per in rows.items():
+        rolls = sum(s["rolls"] for s in per.values())
+        wins = sum(s["wins"] for s in per.values())
+        name = (next(iter(per.values()), {}).get("name") or str(uid))[:24]
+        extras = []
+        for emoji, s in per.items():
+            if s["rolls"]:
+                if emoji == "🎲":
+                    extras.append("🎲%d" % s["rolls"])
+                elif emoji == "🎰":
+                    extras.append("🎰%d/%d" % (s["wins"], s["rolls"]))
+                else:
+                    extras.append("%s%d/%d" % (emoji, s["wins"], s["rolls"]))
+        table.append((rolls, wins, name, " ".join(extras)))
+        total_rolls += rolls
+        total_wins += wins
+    table.sort(key=lambda x: -x[0])
+    lines = ["🎱 Броски кубиками в этом чате:"]
+    for rolls, wins, name, extras in table[:15]:
+        lines.append("%s — %d бросков, %d побед (%s)" % (name, rolls, wins, extras))
+    lines.append("\nВсего: %d бросков, %d побед" % (total_rolls, total_wins))
+    return "\n".join(lines)
+
+
+@bot.on(events.NewMessage(pattern=r"^/dice(@\w+)?(\s|$)"))
+async def cmd_dice(ev):
+    if spam_blocked(ev, "dice"): return
+    if not ev.is_group:
+        await ev.reply("/dice работает в группах — там и считаем броски.")
+        return
+    await ev.reply(render_dice(ev.chat_id))
+
+
+
 
 @bot.on(events.NewMessage(chats=GROUP))
 async def plan_watch(ev):
@@ -1171,6 +1305,7 @@ async def cmd_start(ev):
                        "/nosir — отключить сир и мэс (только эмодзи)\n"
                        "/emoji — выбрать эмодзи для упоминаний\n"
                        "/ping <юз> <n> — n сообщений с одним юзо\n"
+                       "/dice — счётчик бросков кубиков\n"
                        "/vonyat — проверка: пинг и жив ли юзербот")
 
 
@@ -1405,7 +1540,7 @@ async def cmd_all(ev):
         return
     items, seen = [], set()
     try:
-        async for u in ub.iter_participants(ev.chat_id):
+        async for u in bot.iter_participants(ev.chat_id):
             if getattr(u, "bot", False) or getattr(u, "deleted", False):
                 continue
             prof = STATE["users"].get(str(u.id))
@@ -1518,12 +1653,18 @@ async def _run():
     load_muted()
     load_users()
     load_sir()
+    load_dice()
 
     await bot.start(bot_token=ENV["BOT_TOKEN"])
-    await ub.connect()
-    if not await ub.is_user_authorized():
-        log.error("юзербот (sessions/ikt-bot) не авторизован")
-        return
+    if STATE["ub_enabled"]:
+        try:
+            await ub.connect()
+            if not await ub.is_user_authorized():
+                log.error("юзербот не авторизован — отключаю его, работаю бот-only")
+                STATE["ub_enabled"] = False
+        except Exception as e:
+            log.error("юзербот не подключился: %s — отключаю его, работаю бот-only", e)
+            STATE["ub_enabled"] = False
 
     load_route_model()
     load_saved_plan()          # план переживает рестарт даже без оригинала в чате
@@ -1546,7 +1687,12 @@ async def _run():
     asyncio.create_task(poll_group())
     asyncio.create_task(plan_watchdog())
     asyncio.create_task(sir_loop())
-    await asyncio.gather(bot.run_until_disconnected(), ub.run_until_disconnected())
+    disconns = [bot.run_until_disconnected()]
+    if STATE["ub_enabled"]:
+        disconns.append(ub.run_until_disconnected())
+    else:
+        log.info("юзербот отключён (config ub_enabled=false) — только бот")
+    await asyncio.gather(*disconns)
 
 
 if __name__ == "__main__":

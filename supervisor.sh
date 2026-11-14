@@ -1,6 +1,10 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # supervisor.sh — держит main.py живым: упал → перезапуск через 5 сек.
+# Один supervisor — один замок: второй тихо выходит, чтобы не сжечь сессию.
 cd "$(dirname "$0")"
+mkdir -p .run
+exec 9>.run/.supervisor.lock
+flock -n 9 || { echo "supervisor уже работает (lock .run/.supervisor.lock) — выхожу"; exit 0; }
 echo "[supervisor] старт $(date '+%d.%m %H:%M:%S')"
 pkill -9 -f "[p]ython main.py" 2>/dev/null || true   # осиротевшие инстансы
 while true; do
