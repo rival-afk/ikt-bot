@@ -1612,7 +1612,7 @@ async def cmd_next(ev):
 
 @bot.on(events.NewMessage(pattern=r"^/ping(@\w+)?(\s|$)"))
 async def cmd_ping(ev):
-    if spam_blocked(ev, "ping", 1, 30): return
+    if spam_blocked(ev, "ping", 4, 60): return
     """/ping <юз> <n> — бот отправит n сообщений, каждое только из юза.
     На сам /ping не отвечает — просто пишет."""
     m = re.match(r"^/ping(?:@\w+)?\s+@?([A-Za-z0-9_]{3,32})\s+(\d{1,3})(\s|$)",
