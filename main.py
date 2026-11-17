@@ -1152,6 +1152,74 @@ def spam_blocked(ev, bucket, limit=3, window=60):
     return False
 
 
+MORSE_RU = {
+    ".-": "а", "-...": "б", ".--": "в", "--.": "г", "-..": "д",
+    ".": "е", "...-": "ж", "--..": "з", "..": "и",
+    ".---": "й", "-.-": "к", ".-..": "л", "--": "м", "-.": "н",
+    "---": "о", ".--.": "п", ".-.": "р", "...": "с", "-": "т",
+    "..-": "у", "..-.": "ф", "....": "х", "-.-.": "ц", "---.": "ч",
+    "----": "ш", "--.-": "щ", "--.--": "ъ", "-.--": "ы", "-..-": "ь",
+    "..-..": "э", "..--": "ю", ".-.-": "я",
+    ".----": "1", "..---": "2", "...--": "3", "....-": "4", ".....": "5",
+    "-....": "6", "--...": "7", "---..": "8", "----.": "9", "-----": "0",
+}
+MORSE_LAT = {
+    ".-": "a", "-...": "b", "-.-.": "c", "-..": "d", ".": "e", "..-.": "f",
+    "--.": "g", "....": "h", "..": "i", ".---": "j", "-.-": "k", ".-..": "l",
+    "--": "m", "-.": "n", "---": "o", ".--.": "p", "--.-": "q", ".-.": "r",
+    "...": "s", "-": "t", "..-": "u", "...-": "v", ".--": "w", "-..-": "x",
+    "-.--": "y", "--..": "z",
+}
+
+
+def decode_morse(text):
+    """Расшифровать Морзе из сообщения из «.», «_»/«-», пробелов и переводов строк.
+    → декодированная строка заглавными или None, если это не Морзе."""
+    t = (text or "").strip()
+    if not t:
+        return None
+    if re.sub(r"[\s\._\-‐–—]+", "", t):          # что-то лишнее — не Морзе
+        return None
+    if not re.search(r"[\._\-‐–—]", t):
+        return None
+    t = t.replace("_", "-").replace("–", "-").replace("—", "-").replace("‐", "-")
+    t = re.sub(r"[\n\r]+", " / ", t)
+    t = re.sub(r" {3,}", " / ", t)
+    words = [w for w in t.split(" / ") if w.strip()]
+    out = []
+    ok_letters = 0
+    for word in words:
+        letters = []
+        for token in word.split():
+            token = token.strip()
+            if not token:
+                continue
+            if token in MORSE_RU:
+                letters.append(MORSE_RU[token].upper())
+                ok_letters += 1
+            elif token in MORSE_LAT:
+                letters.append(MORSE_LAT[token].upper())
+                ok_letters += 1
+            else:
+                letters.append("□")
+        if letters:
+            out.append("".join(letters))
+    decoded = " ".join(out)
+    if ok_letters < 2 or "□" in decoded:
+        return None
+    return decoded
+
+
+@bot.on(events.NewMessage(chats=GROUPS))
+async def morse_watch(ev):
+    dec = decode_morse(ev.message.message or "")
+    if not dec:
+        return
+    if spam_blocked(ev, "morse", 3, 60):
+        return
+    await ev.reply("Морзе: %s" % dec)
+
+
 DICE_FILE = ROOT / "sessions" / ".dice.json"
 DICE_NAMES = {"🎲": "кубик", "🎯": "дартс", "🎳": "боулинг", "🏀": "баскетбол",
               "⚽": "футбол", "🎰": "слоты"}
